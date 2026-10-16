@@ -1,9 +1,9 @@
 <!--
 Sync Impact Report
-Version change: (unratified template) → 1.0.0
-Modified principles: none (initial adoption; 5 principles defined)
-Added sections: Core Principles, Technical Constraints, Development Workflow, Governance
-Removed sections: none
+Version change: 1.0.0 → 1.0.1
+Modified principles: none
+Modified sections: Technical Constraints (datastore: MariaDB only, MariaDB syntax allowed)
+Added/Removed sections: none
 Deferred TODOs: none
 -->
 # EC2 Scraping Constitution
@@ -37,7 +37,8 @@ artifacts stored in `specs/`. Rationale: decisions stay traceable and reviewable
 
 - Language: Python 3.12+, managed with `uv`; lint/format with `ruff`; types with `ty`; tests with
   `pytest`.
-- Primary datastore: MySQL/MariaDB (InnoDB, utf8mb4), using the common syntax subset.
+- Datastore: MariaDB only (InnoDB, utf8mb4). MariaDB-specific syntax (e.g. `ADD COLUMN IF NOT
+  EXISTS`) is permitted; MySQL compatibility is NOT required.
 - Credentials MUST come from the standard AWS credential chain or environment, and MUST NOT be
   committed to the repository.
 
@@ -55,4 +56,4 @@ expanding them, PATCH for clarifications. Plans and reviews MUST verify complian
 unavoidable violations MUST be justified in the plan's Complexity Tracking. Runtime guidance for
 agents lives in `AGENTS.md`.
 
-**Version**: 1.0.0 | **Ratified**: 2026-10-16 | **Last Amended**: 2026-10-16
+**Version**: 1.0.1 | **Ratified**: 2026-10-16 | **Last Amended**: 2026-10-16
