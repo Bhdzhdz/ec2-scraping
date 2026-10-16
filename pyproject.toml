@@ -5,7 +5,10 @@ description = "Geenerate an inventory of the ec2 instances on an aws account and
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "Bernardo Hernandez Hernandez", email = "bhdzhdz@gmail.com" }]
-dependencies = []
+dependencies = [
+    "boto3>=1.43.114",
+    "pymysql>=1.2.3",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -54,3 +57,6 @@ version_provider = "uv"
 tag_format = "v$version"
 update_changelog_on_bump = true
 major_version_zero = true
+
+[tool.ruff.lint.per-file-ignores]
+"tests/schema/*" = ["E501", "PT018", "C408"]
