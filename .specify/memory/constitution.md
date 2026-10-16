@@ -1,50 +1,58 @@
-# [PROJECT_NAME] Constitution
-<!-- Example: Spec Constitution, TaskFlow Constitution, etc. -->
+<!--
+Sync Impact Report
+Version change: (unratified template) → 1.0.0
+Modified principles: none (initial adoption; 5 principles defined)
+Added sections: Core Principles, Technical Constraints, Development Workflow, Governance
+Removed sections: none
+Deferred TODOs: none
+-->
+# EC2 Scraping Constitution
 
 ## Core Principles
 
-### [PRINCIPLE_1_NAME]
-<!-- Example: I. Library-First -->
-[PRINCIPLE_1_DESCRIPTION]
-<!-- Example: Every feature starts as a standalone library; Libraries must be self-contained, independently testable, documented; Clear purpose required - no organizational-only libraries -->
+### I. Read-Only AWS Access
+The scraper MUST only call AWS describe/list operations. It MUST NOT create, modify, or delete any
+AWS resource. Rationale: an inventory tool must be safe to run against production accounts.
 
-### [PRINCIPLE_2_NAME]
-<!-- Example: II. CLI Interface -->
-[PRINCIPLE_2_DESCRIPTION]
-<!-- Example: Every library exposes functionality via CLI; Text in/out protocol: stdin/args → stdout, errors → stderr; Support JSON + human-readable formats -->
+### II. Normalized, Idempotent Persistence
+The inventory schema MUST be in Third Normal Form, with documented exceptions only. All DDL MUST be
+versioned plain SQL, re-runnable without data loss, and loads MUST upsert (never duplicate)
+resources. Rationale: repeated scrapes must converge on one consistent inventory.
 
-### [PRINCIPLE_3_NAME]
-<!-- Example: III. Test-First (NON-NEGOTIABLE) -->
-[PRINCIPLE_3_DESCRIPTION]
-<!-- Example: TDD mandatory: Tests written → User approved → Tests fail → Then implement; Red-Green-Refactor cycle strictly enforced -->
+### III. Test-First Verification
+Behavior changes MUST be accompanied by tests written before or with the implementation; schema
+changes MUST be verified against a real database. Lint, type check, and tests MUST pass before
+merge. Rationale: schema and scraping bugs corrupt data silently.
 
-### [PRINCIPLE_4_NAME]
-<!-- Example: IV. Integration Testing -->
-[PRINCIPLE_4_DESCRIPTION]
-<!-- Example: Focus areas requiring integration tests: New library contract tests, Contract changes, Inter-service communication, Shared schemas -->
+### IV. Simplicity
+Features MUST start with the simplest design that satisfies the spec; added dependencies, tables,
+or abstractions MUST be justified in the plan. Rationale: small surface area keeps cost and
+maintenance low.
 
-### [PRINCIPLE_5_NAME]
-<!-- Example: V. Observability, VI. Versioning & Breaking Changes, VII. Simplicity -->
-[PRINCIPLE_5_DESCRIPTION]
-<!-- Example: Text I/O ensures debuggability; Structured logging required; Or: MAJOR.MINOR.BUILD format; Or: Start simple, YAGNI principles -->
+### V. Spec-Driven Development
+Non-trivial work MUST follow the Spec Kit flow (specify → clarify → plan → tasks → implement), with
+artifacts stored in `specs/`. Rationale: decisions stay traceable and reviewable.
 
-## [SECTION_2_NAME]
-<!-- Example: Additional Constraints, Security Requirements, Performance Standards, etc. -->
+## Technical Constraints
 
-[SECTION_2_CONTENT]
-<!-- Example: Technology stack requirements, compliance standards, deployment policies, etc. -->
+- Language: Python 3.12+, managed with `uv`; lint/format with `ruff`; types with `ty`; tests with
+  `pytest`.
+- Primary datastore: MySQL/MariaDB (InnoDB, utf8mb4), using the common syntax subset.
+- Credentials MUST come from the standard AWS credential chain or environment, and MUST NOT be
+  committed to the repository.
 
-## [SECTION_3_NAME]
-<!-- Example: Development Workflow, Review Process, Quality Gates, etc. -->
+## Development Workflow
 
-[SECTION_3_CONTENT]
-<!-- Example: Code review requirements, testing gates, deployment approval process, etc. -->
+- Commits MUST follow Conventional Commits (enforced by a commitizen `commit-msg` hook).
+- Pre-commit runs ruff and hygiene checks; pre-push runs `ty` and `pytest`.
+- Each plan MUST include a Constitution Check against this document.
 
 ## Governance
-<!-- Example: Constitution supersedes all other practices; Amendments require documentation, approval, migration plan -->
 
-[GOVERNANCE_RULES]
-<!-- Example: All PRs/reviews must verify compliance; Complexity must be justified; Use [GUIDANCE_FILE] for runtime development guidance -->
+This constitution supersedes other practices. Amendments require a documented change to this file
+with a version bump: MAJOR for removing or redefining principles, MINOR for adding or materially
+expanding them, PATCH for clarifications. Plans and reviews MUST verify compliance, and
+unavoidable violations MUST be justified in the plan's Complexity Tracking. Runtime guidance for
+agents lives in `AGENTS.md`.
 
-**Version**: [CONSTITUTION_VERSION] | **Ratified**: [RATIFICATION_DATE] | **Last Amended**: [LAST_AMENDED_DATE]
-<!-- Example: Version: 2.1.1 | Ratified: 2025-06-13 | Last Amended: 2025-07-16 -->
+**Version**: 1.0.0 | **Ratified**: 2026-10-16 | **Last Amended**: 2026-10-16
