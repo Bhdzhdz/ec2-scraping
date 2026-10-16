@@ -1,0 +1,12 @@
+# Changes here will be overwritten by Copier; NEVER EDIT MANUALLY
+_commit: v1.0.0
+_src_path: ../python-template/
+author_email: bhdzhdz@gmail.com
+author_name: Bernardo Hernandez Hernandez
+description: 'Geenerate an inventory of the ec2 instances on an aws account and get
+    metadata from them '
+package_name: ec2_scraping
+project_name: EC2 Scraping
+project_slug: ec2-scraping
+python_version: '3.12'
+use_github_actions: false
