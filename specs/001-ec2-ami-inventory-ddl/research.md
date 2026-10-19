@@ -27,9 +27,10 @@
 ## Timestamps
 - **Decision**: `first_seen_at`, `last_seen_at`, `last_scrape_run_id` on instance and AMI; deliberate denormalization (FR-020).
 
-## Migrations
-- **Decision**: Numbered idempotent SQL files; no migration tool in v1.
-- **Rationale**: Tooling is out of scope; ordered files are tool-agnostic.
+## ORM & Migrations (001.1)
+- **Decision**: SQLAlchemy 2.0 Declarative (`Mapped` / `mapped_column`) with `sqlalchemy.dialects.mysql` types (`BIGINT(unsigned=True)`, `INTEGER(unsigned=True)`, `ENUM`, `CHAR`) + Alembic migrations (`alembic upgrade head`).
+- **Rationale**: Single source of truth in typed Python models while preserving exact MariaDB/MySQL column types, constraints, and indexes; `alembic upgrade head` is idempotent when already at head (SC-001).
+- **Alternatives**: Raw SQL files — harder to compose with ORM queries and lacks automatic drift check (`alembic check`).
 
 ## Testing
-- **Decision**: pytest + PyMySQL against a disposable MariaDB; skip when DSN unset.
+- **Decision**: pytest + SQLAlchemy/Alembic + PyMySQL against a disposable MariaDB (`MARIADB_TEST_DSN`), plus offline metadata/migration verification so unit tests run without a live DB.

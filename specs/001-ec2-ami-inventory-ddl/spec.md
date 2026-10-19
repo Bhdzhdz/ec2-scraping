@@ -88,7 +88,7 @@ An operator wants to know when each record was first seen, last seen, and from w
 - **FR-011**: Re-loading an existing resource MUST update it in place (no duplicates), enforced by uniqueness constraints.
 - **FR-012**: Deleting a parent record MUST remove its dependent tags and attachments.
 - **FR-013**: The DDL MUST be re-runnable safely (idempotent) and include indexes supporting lookups by state, instance type, AMI ID, and tag key/value.
-- **FR-014**: The DDL MUST be stored in the repository as versioned, plain SQL files targeting MySQL/MariaDB (InnoDB, utf8mb4).
+- **FR-014**: The DDL MUST be defined as SQLAlchemy 2.0 ORM models with versioned Alembic migrations targeting MySQL/MariaDB (InnoDB, utf8mb4).
 - **FR-015**: The schema MUST be normalized to Third Normal Form (3NF): every non-key attribute depends only on its table's key; no repeating groups or multi-valued columns; no attribute that is determined by another non-key attribute.
 - **FR-016**: Repeated descriptive values MUST live in reference tables referenced by key rather than duplicated as free text on each row: account, region, availability zone, instance type (with vCPU/memory/architecture facts), key pair, IAM instance profile, VPC, subnet, and security group.
 - **FR-017**: Tags MUST be stored once in a single tag table per resource kind (instance, AMI) as (resource key, tag key, tag value), not as columns or serialized blobs.
@@ -126,7 +126,7 @@ An operator wants to know when each record was first seen, last seen, and from w
 
 - Target database is MySQL/MariaDB (see Clarifications); DDL may use engine-specific syntax and types.
 - Data is gathered from multiple AWS accounts and regions, so identifiers are scoped by account and region.
-- Only the schema (DDL) is in scope; the scraping/loading code, migrations tooling, and reporting are out of scope.
+- The schema is expressed via SQLAlchemy 2.0 Declarative ORM models and Alembic migrations; the scraping/loading code and reporting are out of scope for this feature.
 - Schema targets 3NF; further forms (BCNF/4NF) are not required unless a violation is found during planning.
 - Only the latest state is stored (see Clarifications); history of state changes is out of scope for v1, and only first-seen/last-seen are kept.
 - Other resource types (EBS volumes, snapshots as standalone inventory, etc.) are out of scope.

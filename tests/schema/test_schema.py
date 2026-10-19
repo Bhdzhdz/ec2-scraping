@@ -4,8 +4,8 @@ import pytest
 from .conftest import apply_migrations, insert
 
 
-def test_migrations_apply_twice(db):
-    apply_migrations(db)  # second application must not fail (SC-001, FR-013)
+def test_migrations_apply_twice(db, dsn):
+    apply_migrations(dsn)  # second application must not fail (SC-001, FR-013)
 
 
 def test_reference_unique_keys(db):

@@ -66,12 +66,25 @@ All tables: InnoDB, utf8mb4, `IF NOT EXISTS`, no destructive statements; `id` is
 - [X] T024 [P] Add a `db/README.md` documenting migration order and soft instance-to-AMI link, and note the DB test setup in `README.md`
 - [X] T025 Run quickstart.md validation, then `uv run ruff check --fix . && uv run ruff format . && uv run ty check && uv run pytest -q -x --tb=short`
 
+## Phase 7: 001.1 ORM & Alembic Implementation
+
+- [X] T026 Add `sqlalchemy>=2.0` and `alembic>=1.13` to `pyproject.toml` dependencies and run `uv sync`
+- [X] T027 Create `src/ec2_scraping/db/base.py` with `Base(DeclarativeBase)` configured for InnoDB and `utf8mb4`
+- [X] T028 [US1] [US2] [US3] Implement SQLAlchemy 2.0 ORM models in `src/ec2_scraping/db/models.py` for all 18 tables (`Account`, `Region`, `AvailabilityZone`, `InstanceType`, `KeyPair`, `IamInstanceProfile`, `Vpc`, `Subnet`, `SecurityGroup`, `ScrapeRun`, `ScrapeRunScope`, `Instance`, `InstanceSecurityGroup`, `InstanceVolume`, `InstanceNetworkInterface`, `InstanceTag`, `Ami`, `AmiBlockDeviceMapping`, `AmiTag`)
+- [X] T029 Create `src/ec2_scraping/db/session.py` (and `src/ec2_scraping/db/__init__.py`) with engine/session helpers and programmatic `upgrade_db(dsn)` using Alembic
+- [X] T030 Configure `alembic.ini` and `src/ec2_scraping/db/migrations/` (`env.py`, `script.py.mako`, `versions/0001_initial_schema.py`) and remove legacy raw-SQL `db/migrations/*.sql`
+- [X] T031 [P] Add `tests/schema/test_orm_metadata.py` to verify all 18 ORM tables, primary/unique/foreign keys, indexes, and offline Alembic migration DDL generation without requiring a live DB
+- [X] T032 Update `tests/schema/conftest.py` and `tests/schema/test_schema.py` to apply schema via Alembic (`upgrade_db`) and verify idempotent re-runs (`alembic upgrade head` twice)
+- [X] T033 [P] Update `db/README.md` and `README.md` to document the SQLAlchemy ORM models and Alembic migration workflow
+- [X] T034 Run `uv run ruff check --fix . && uv run ruff format . && uv run ty check && uv run pytest -q -x --tb=short`
+
 ## Dependencies & Order
 
-- Phase 1 → Phase 2 → stories → Polish.
+- Phase 1 → Phase 2 → stories → Polish → Phase 7 (001.1 ORM & Alembic).
 - US1 and US2 are independent after Phase 2 (different migration files); US3 needs both.
 - Within a story, tests (marked [P]) are written first and should fail before the migration tasks.
 - T004→T005 and T012→T013→T014→T015 edit the same files and are sequential.
+- In Phase 7: T026 → T027 → T028 → T029 → T030 → (T031, T032, T033) → T034.
 
 ## Parallel Examples
 
@@ -82,4 +95,4 @@ All tables: InnoDB, utf8mb4, `IF NOT EXISTS`, no destructive statements; `id` is
 ## Implementation Strategy
 
 - **MVP**: Phases 1–3 (instance inventory); validate before continuing.
-- Then add AMIs (US2), then history (US3), then polish and performance.
+- Then add AMIs (US2), then history (US3), then polish and performance, then 001.1 ORM + Alembic migration.

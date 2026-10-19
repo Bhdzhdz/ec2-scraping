@@ -1,15 +1,13 @@
-"""Fixtures that apply db/migrations to a disposable MariaDB/MySQL database."""
+"""Fixtures that apply Alembic migrations to a disposable MariaDB/MySQL database."""
 
 import os
-import re
-from pathlib import Path
 from urllib.parse import urlparse
 
 import pymysql
 import pymysql.cursors
 import pytest
 
-MIGRATIONS = sorted((Path(__file__).parents[2] / "db" / "migrations").glob("*.sql"))
+from ec2_scraping.db.session import upgrade_db
 
 
 def _connect(dsn: str, database: str | None):
@@ -25,12 +23,8 @@ def _connect(dsn: str, database: str | None):
     )
 
 
-def apply_migrations(conn) -> None:
-    for path in MIGRATIONS:
-        sql = re.sub(r"^\s*--.*$", "", path.read_text(), flags=re.M)
-        with conn.cursor() as cur:
-            for stmt in filter(None, (s.strip() for s in sql.split(";"))):
-                cur.execute(stmt)
+def apply_migrations(dsn: str) -> None:
+    upgrade_db(dsn, "head")
 
 
 @pytest.fixture(scope="session")
@@ -49,8 +43,8 @@ def db(dsn):
         cur.execute(f"DROP DATABASE IF EXISTS `{name}`")
         cur.execute(f"CREATE DATABASE `{name}` CHARACTER SET utf8mb4")
     root.close()
+    apply_migrations(dsn)
     conn = _connect(dsn, name)
-    apply_migrations(conn)
     yield conn
     conn.close()
 

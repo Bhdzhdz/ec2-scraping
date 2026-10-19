@@ -6,8 +6,10 @@ readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "Bernardo Hernandez Hernandez", email = "bhdzhdz@gmail.com" }]
 dependencies = [
+    "alembic>=1.13",
     "boto3>=1.43.114",
     "pymysql>=1.2.3",
+    "sqlalchemy>=2.0",
 ]
 
 [build-system]
