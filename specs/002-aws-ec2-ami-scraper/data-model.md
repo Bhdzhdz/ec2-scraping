@@ -2,7 +2,7 @@
 
 Uses all 001 tables ([../001-ec2-ami-inventory-ddl/data-model.md](../001-ec2-ami-inventory-ddl/data-model.md)). One change:
 
-## `scrape_run_scope` (migration `0006_scrape_scope_status.sql`)
+## `scrape_run_scope` (Alembic migration `0002_scrape_scope_status.py` / `ScrapeRunScope` ORM model)
 | Column | Type | Notes |
 |---|---|---|
 | `status` | ENUM('succeeded','failed','skipped') NOT NULL DEFAULT 'succeeded' | per account/region outcome |

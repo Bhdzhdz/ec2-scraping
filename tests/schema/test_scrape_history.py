@@ -21,7 +21,7 @@ def test_missing_in_latest_run(db, ref):
     assert fetch(db, "SELECT first_seen_at FROM instance WHERE id=%s", (gone,))[0] == first_seen
 
 
-def test_scope_status_column_defaults_and_is_rerunnable(db, ref):
+def test_scope_status_column_defaults_and_is_rerunnable(db, dsn, ref):
     from .conftest import apply_migrations
 
     run = insert(db, "INSERT INTO scrape_run () VALUES ()")
@@ -30,6 +30,6 @@ def test_scope_status_column_defaults_and_is_rerunnable(db, ref):
         "INSERT INTO scrape_run_scope (scrape_run_id, account_id, region_id) VALUES (%s, %s, %s)",
         (run, ref["account"], ref["region"]),
     )
-    apply_migrations(db)  # 0006 must be re-runnable without error
+    apply_migrations(dsn)  # 0002 must be re-runnable without error
     row = fetch(db, "SELECT status, error FROM scrape_run_scope WHERE scrape_run_id=%s", (run,))
     assert row == [{"status": "succeeded", "error": None}]

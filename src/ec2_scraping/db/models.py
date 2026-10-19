@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String, UniqueConstraint, text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.mysql import CHAR, ENUM
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -11,6 +11,7 @@ from ec2_scraping.db.base import Base, UBigInt, UInt
 _TABLE_DEFAULTS: dict[str, str] = {"mysql_engine": "InnoDB", "mysql_charset": "utf8mb4"}
 
 SCRAPE_STATUS_VALUES = ("running", "succeeded", "failed", "partial")
+SCRAPE_SCOPE_STATUS_VALUES = ("succeeded", "failed", "skipped")
 INSTANCE_STATE_VALUES = (
     "pending",
     "running",
@@ -197,6 +198,10 @@ class ScrapeRunScope(Base):
     region_id: Mapped[int] = mapped_column(
         UBigInt, ForeignKey("region.id", name="fk_scope_region"), primary_key=True
     )
+    status: Mapped[str] = mapped_column(
+        ENUM(*SCRAPE_SCOPE_STATUS_VALUES), nullable=False, server_default=text("'succeeded'")
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class Instance(Base):

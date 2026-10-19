@@ -44,6 +44,7 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "C4", "RUF", "PT"]
 docstring-code-format = true
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
 testpaths = ["tests"]
 addopts = "--strict-markers --strict-config --cov=ec2_scraping --cov-report=term-missing"
 

@@ -1,35 +1,58 @@
 """Resources not seen in the latest successful run of their (account, region) scope."""
 
-_SQL = """
-SELECT '{kind}' AS kind, a.aws_account_id, rg.code AS region, t.{id_col} AS resource_id,
-       t.last_seen_at
-FROM `{table}` t
-JOIN (
-  SELECT account_id, region_id, MAX(scrape_run_id) AS run_id
-  FROM scrape_run_scope WHERE status = 'succeeded' GROUP BY account_id, region_id
-) latest ON latest.account_id = t.account_id AND latest.region_id = t.region_id
-JOIN account a ON a.id = t.account_id
-JOIN region rg ON rg.id = t.region_id
-WHERE (t.last_scrape_run_id IS NULL OR t.last_scrape_run_id < latest.run_id){filters}
-ORDER BY a.aws_account_id, rg.code, t.{id_col}
-"""
+from sqlalchemy import func, literal, or_, select
+from sqlalchemy.orm import Session
+
+from ec2_scraping.db.models import Account, Ami, Instance, Region, ScrapeRunScope
 
 
-def find_missing(conn, account_ids: list[str] | None = None, regions: list[str] | None = None):
+def find_missing(
+    db: Session,
+    account_ids: list[str] | None = None,
+    regions: list[str] | None = None,
+) -> list[dict]:
     """Return dict rows (kind, aws_account_id, region, resource_id, last_seen_at)."""
-    filters, args = "", []
-    if account_ids:
-        filters += f" AND a.aws_account_id IN ({', '.join(['%s'] * len(account_ids))})"
-        args += account_ids
-    if regions:
-        filters += f" AND rg.code IN ({', '.join(['%s'] * len(regions))})"
-        args += regions
+    latest = (
+        select(
+            ScrapeRunScope.account_id,
+            ScrapeRunScope.region_id,
+            func.max(ScrapeRunScope.scrape_run_id).label("run_id"),
+        )
+        .where(ScrapeRunScope.status == "succeeded")
+        .group_by(ScrapeRunScope.account_id, ScrapeRunScope.region_id)
+        .subquery("latest")
+    )
+
     rows: list[dict] = []
-    with conn.cursor() as cur:
-        for kind, table, id_col in (
-            ("instance", "instance", "instance_id"),
-            ("ami", "ami", "image_id"),
-        ):
-            cur.execute(_SQL.format(kind=kind, table=table, id_col=id_col, filters=filters), args)
-            rows += list(cur.fetchall())
+    for kind, model, id_col in (
+        ("instance", Instance, Instance.instance_id),
+        ("ami", Ami, Ami.image_id),
+    ):
+        stmt = (
+            select(
+                literal(kind).label("kind"),
+                Account.aws_account_id,
+                Region.code.label("region"),
+                id_col.label("resource_id"),
+                model.last_seen_at,
+            )
+            .join(
+                latest,
+                (latest.c.account_id == model.account_id) & (latest.c.region_id == model.region_id),
+            )
+            .join(Account, Account.id == model.account_id)
+            .join(Region, Region.id == model.region_id)
+            .where(
+                or_(
+                    model.last_scrape_run_id.is_(None),
+                    model.last_scrape_run_id < latest.c.run_id,
+                )
+            )
+        )
+        if account_ids:
+            stmt = stmt.where(Account.aws_account_id.in_(account_ids))
+        if regions:
+            stmt = stmt.where(Region.code.in_(regions))
+        stmt = stmt.order_by(Account.aws_account_id, Region.code, id_col)
+        rows.extend(dict(r._mapping) for r in db.execute(stmt).all())
     return rows

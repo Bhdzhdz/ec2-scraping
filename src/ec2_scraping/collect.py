@@ -55,6 +55,8 @@ def map_instance(raw: dict) -> InstanceRecord:
         if b.get("Ebs")
     ]
     monitoring = (raw.get("Monitoring") or {}).get("State", "disabled")
+    launch_time = _naive_utc(raw["LaunchTime"])
+    assert launch_time is not None
     return InstanceRecord(
         instance_id=raw["InstanceId"],
         instance_type=raw["InstanceType"],
@@ -62,7 +64,7 @@ def map_instance(raw: dict) -> InstanceRecord:
         image_id=raw["ImageId"],
         state=raw["State"]["Name"],
         architecture=raw.get("Architecture", "unknown"),
-        launch_time=_naive_utc(raw["LaunchTime"]),
+        launch_time=launch_time,
         vpc_id=raw.get("VpcId"),
         subnet_id=raw.get("SubnetId"),
         key_name=raw.get("KeyName"),

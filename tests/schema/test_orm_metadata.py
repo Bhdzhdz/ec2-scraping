@@ -184,11 +184,13 @@ def test_offline_alembic_upgrade_and_downgrade_sql():
     sql_up = buf.getvalue()
     for table_name in EXPECTED_TABLES:
         assert f"CREATE TABLE IF NOT EXISTS {table_name}" in sql_up
+    assert "ALTER TABLE scrape_run_scope ADD COLUMN IF NOT EXISTS status" in sql_up
 
     cfg = make_alembic_config("mysql://u:p@localhost:3306/inv")
     buf_down = io.StringIO()
     with redirect_stdout(buf_down):
-        command.downgrade(cfg, "0001_initial_schema:base", sql=True)
+        command.downgrade(cfg, "0002_scrape_scope_status:base", sql=True)
     sql_down = buf_down.getvalue()
+    assert "ALTER TABLE scrape_run_scope DROP COLUMN IF EXISTS error" in sql_down
     for table_name in EXPECTED_TABLES:
         assert f"DROP TABLE IF EXISTS {table_name}" in sql_down

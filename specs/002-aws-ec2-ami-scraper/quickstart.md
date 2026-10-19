@@ -1,7 +1,7 @@
 # Quickstart: Validate the Scraper
 
 ## Prerequisites
-- `uv sync`; MariaDB test DB per [001 quickstart](../001-ec2-ami-inventory-ddl/quickstart.md), migrations 0001–0006 applied.
+- `uv sync`; MariaDB test DB per [001 quickstart](../001-ec2-ami-inventory-ddl/quickstart.md), Alembic migrations (`uv run alembic upgrade head`) applied.
 - `export MARIADB_TEST_DSN=...`
 - For live check: `aws sso login --profile <name>` (read-only EC2 permissions).
 

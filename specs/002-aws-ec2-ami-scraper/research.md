@@ -19,11 +19,11 @@
 - **Alternatives**: custom retry loop (more code).
 
 ## Persistence
-- **Decision**: one DB transaction per combination: upsert refs → instances/AMIs (`INSERT ... ON DUPLICATE KEY UPDATE`, preserving `first_seen_at`) → replace child rows (tags, SGs, volumes, ENIs, block mappings) by delete-then-insert for the resource → commit. Rollback on error (FR-015, FR-010).
+- **Decision**: one SQLAlchemy `Session` transaction per combination: upsert refs via `sqlalchemy.dialects.mysql.insert(...).on_duplicate_key_update(...)` → sync `Instance`/`Ami` ORM rows (preserving `first_seen_at`) → replace child ORM rows (tags, SGs, volumes, ENIs, block mappings) by delete-then-insert for the resource → commit. Rollback on error (FR-015, FR-010).
 - **Alternatives**: row-by-row autocommit (not atomic).
 
 ## Scrape-run status and missing resources
-- **Decision**: migration 0006 adds `status ENUM('succeeded','failed','skipped')` and `error TEXT NULL` to `scrape_run_scope`. Run status: all succeeded → `succeeded`; some → `partial`; none → `failed`. Status assignment (`skipped` vs `failed`) and the unchanged-count rule are defined in data-model.md. Missing = resources in (account, region) whose latest `succeeded` scope run is newer than/different from their `last_scrape_run_id`.
+- **Decision**: Alembic migration `0002_scrape_scope_status` adds `status ENUM('succeeded','failed','skipped')` and `error TEXT NULL` to `scrape_run_scope` (`ScrapeRunScope` ORM model). Run status: all succeeded → `succeeded`; some → `partial`; none → `failed`. Status assignment (`skipped` vs `failed`) and the unchanged-count rule are defined in data-model.md. Missing = resources in (account, region) whose latest `succeeded` scope run is newer than/different from their `last_scrape_run_id`.
 - **Rationale**: without per-combination status, partial failures would wrongly mark resources missing (spec US3 scenario 2).
 - **Alternatives**: store only successful combos (loses FR-011 attempted record).
 

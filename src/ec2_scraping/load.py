@@ -1,97 +1,122 @@
-"""Transactional upserts of collected data into the 001 schema (MariaDB)."""
+"""Transactional upserts of collected data into the 3NF schema using SQLAlchemy 2.0."""
 
 from typing import Any
 
+from sqlalchemy import delete, func, select
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.orm import Session
+
+from ec2_scraping.db.base import Base
+from ec2_scraping.db.models import (
+    Account,
+    Ami,
+    AmiBlockDeviceMapping,
+    AmiTag,
+    AvailabilityZone,
+    IamInstanceProfile,
+    Instance,
+    InstanceNetworkInterface,
+    InstanceSecurityGroup,
+    InstanceTag,
+    InstanceType,
+    InstanceVolume,
+    KeyPair,
+    Region,
+    SecurityGroup,
+    Subnet,
+    Vpc,
+)
 from ec2_scraping.models import AmiRecord, Collected, Counts, InstanceRecord
 
 
-def _upsert_ref(cur, table: str, keys: dict[str, Any], extra: dict[str, Any] | None = None) -> int:
+def _upsert_ref(
+    db: Session,
+    model: type[Base],
+    keys: dict[str, Any],
+    extra: dict[str, Any] | None = None,
+) -> int:
     """Insert-or-update a reference row on its unique key and return its id."""
     extra = extra or {}
     cols = {**keys, **extra}
-    names = ", ".join(f"`{c}`" for c in cols)
-    marks = ", ".join(["%s"] * len(cols))
-    updates = ["id = LAST_INSERT_ID(id)"] + [
-        f"`{c}` = COALESCE(VALUES(`{c}`), `{c}`)" for c in extra
-    ]
-    cur.execute(
-        f"INSERT INTO `{table}` ({names}) VALUES ({marks}) "
-        f"ON DUPLICATE KEY UPDATE {', '.join(updates)}",
-        tuple(cols.values()),
-    )
-    return cur.lastrowid
+    table = model.__table__  # type: ignore[attr-defined]
+    stmt = mysql_insert(model).values(**cols)
+    updates: dict[str, Any] = {"id": func.last_insert_id(table.c.id)}
+    for col_name in extra:
+        updates[col_name] = func.coalesce(stmt.inserted[col_name], table.c[col_name])
+    res: Any = db.execute(stmt.on_duplicate_key_update(**updates))
+    return int(res.lastrowid)
 
 
-def upsert_account(cur, aws_account_id: str) -> int:
-    return _upsert_ref(cur, "account", {"aws_account_id": aws_account_id})
+def upsert_account(db: Session, aws_account_id: str) -> int:
+    return _upsert_ref(db, Account, {"aws_account_id": aws_account_id})
 
 
-def upsert_region(cur, code: str) -> int:
-    return _upsert_ref(cur, "region", {"code": code})
+def upsert_region(db: Session, code: str) -> int:
+    return _upsert_ref(db, Region, {"code": code})
 
 
-def upsert_availability_zone(cur, region_id: int, name: str) -> int:
-    return _upsert_ref(cur, "availability_zone", {"region_id": region_id, "name": name})
+def upsert_availability_zone(db: Session, region_id: int, name: str) -> int:
+    return _upsert_ref(db, AvailabilityZone, {"region_id": region_id, "name": name})
 
 
 def upsert_instance_type(
-    cur,
+    db: Session,
     name: str,
     vcpu: int | None = None,
     memory_mib: int | None = None,
     architecture: str | None = None,
 ) -> int:
     return _upsert_ref(
-        cur,
-        "instance_type",
+        db,
+        InstanceType,
         {"name": name},
         {"vcpu": vcpu, "memory_mib": memory_mib, "architecture": architecture},
     )
 
 
-def upsert_key_pair(cur, account_id: int, region_id: int, name: str) -> int:
+def upsert_key_pair(db: Session, account_id: int, region_id: int, name: str) -> int:
     return _upsert_ref(
-        cur, "key_pair", {"account_id": account_id, "region_id": region_id, "name": name}
+        db, KeyPair, {"account_id": account_id, "region_id": region_id, "name": name}
     )
 
 
-def upsert_iam_instance_profile(cur, account_id: int, region_id: int, arn: str) -> int:
+def upsert_iam_instance_profile(db: Session, account_id: int, region_id: int, arn: str) -> int:
     return _upsert_ref(
-        cur, "iam_instance_profile", {"account_id": account_id, "region_id": region_id, "arn": arn}
+        db, IamInstanceProfile, {"account_id": account_id, "region_id": region_id, "arn": arn}
     )
 
 
-def upsert_vpc(cur, account_id: int, region_id: int, vpc_id: str, cidr: str | None = None) -> int:
+def upsert_vpc(
+    db: Session, account_id: int, region_id: int, vpc_id: str, cidr: str | None = None
+) -> int:
     return _upsert_ref(
-        cur,
-        "vpc",
+        db,
+        Vpc,
         {"account_id": account_id, "region_id": region_id, "vpc_id": vpc_id},
         {"cidr": cidr},
     )
 
 
 def upsert_subnet(
-    cur, vpc_pk: int, availability_zone_id: int, subnet_id: str, cidr: str | None = None
+    db: Session, vpc_pk: int, availability_zone_id: int, subnet_id: str, cidr: str | None = None
 ) -> int:
     return _upsert_ref(
-        cur,
-        "subnet",
+        db,
+        Subnet,
         {"vpc_pk": vpc_pk, "subnet_id": subnet_id},
         {"availability_zone_id": availability_zone_id, "cidr": cidr},
     )
 
 
-def upsert_security_group(cur, vpc_pk: int, group_id: str, name: str | None = None) -> int:
-    return _upsert_ref(
-        cur, "security_group", {"vpc_pk": vpc_pk, "group_id": group_id}, {"name": name}
-    )
+def upsert_security_group(db: Session, vpc_pk: int, group_id: str, name: str | None = None) -> int:
+    return _upsert_ref(db, SecurityGroup, {"vpc_pk": vpc_pk, "group_id": group_id}, {"name": name})
 
 
 class LoadContext:
     """One account/region load: memoises reference lookups for the whole combination."""
 
-    def __init__(self, cur, run_id: int, account_pk: int, region_pk: int):
-        self.cur = cur
+    def __init__(self, db: Session, run_id: int, account_pk: int, region_pk: int):
+        self.db = db
         self.run_id = run_id
         self.account_pk = account_pk
         self.region_pk = region_pk
@@ -104,14 +129,14 @@ class LoadContext:
 
     def az(self, name: str) -> int:
         return self._memo(
-            ("az", name), lambda: upsert_availability_zone(self.cur, self.region_pk, name)
+            ("az", name), lambda: upsert_availability_zone(self.db, self.region_pk, name)
         )
 
     def instance_type(self, name: str, info) -> int:
         return self._memo(
             ("type", name),
             lambda: upsert_instance_type(
-                self.cur,
+                self.db,
                 name,
                 *((info.vcpu, info.memory_mib, info.architecture) if info else (None, None, None)),
             ),
@@ -119,87 +144,86 @@ class LoadContext:
 
     def key_pair(self, name: str) -> int:
         return self._memo(
-            ("key", name), lambda: upsert_key_pair(self.cur, self.account_pk, self.region_pk, name)
+            ("key", name), lambda: upsert_key_pair(self.db, self.account_pk, self.region_pk, name)
         )
 
     def iam_profile(self, arn: str) -> int:
         return self._memo(
             ("iam", arn),
-            lambda: upsert_iam_instance_profile(self.cur, self.account_pk, self.region_pk, arn),
+            lambda: upsert_iam_instance_profile(self.db, self.account_pk, self.region_pk, arn),
         )
 
     def vpc(self, vpc_id: str, cidr: str | None) -> int:
         return self._memo(
             ("vpc", vpc_id),
-            lambda: upsert_vpc(self.cur, self.account_pk, self.region_pk, vpc_id, cidr),
+            lambda: upsert_vpc(self.db, self.account_pk, self.region_pk, vpc_id, cidr),
         )
 
     def subnet(self, vpc_pk: int, az_pk: int, subnet_id: str, cidr: str | None) -> int:
         return self._memo(
             ("subnet", vpc_pk, subnet_id),
-            lambda: upsert_subnet(self.cur, vpc_pk, az_pk, subnet_id, cidr),
+            lambda: upsert_subnet(self.db, vpc_pk, az_pk, subnet_id, cidr),
         )
 
     def security_group(self, vpc_pk: int, group_id: str, name: str | None) -> int:
         return self._memo(
             ("sg", vpc_pk, group_id),
-            lambda: upsert_security_group(self.cur, vpc_pk, group_id, name),
+            lambda: upsert_security_group(self.db, vpc_pk, group_id, name),
         )
 
 
-Child = tuple[str, str, tuple[str, ...], set[tuple]]  # table, fk column, columns, rows
+Child = tuple[type[Base], str, tuple[str, ...], set[tuple]]
 
 
-def _sync(ctx: LoadContext, table: str, key: dict, cols: dict, children: list[Child]) -> str:
+def _sync(
+    ctx: LoadContext,
+    model: type[Instance | Ami],
+    key: dict[str, Any],
+    cols: dict[str, Any],
+    children: list[Child],
+) -> str:
     """Upsert one resource and its child rows; return created/updated/unchanged."""
-    cur = ctx.cur
-    where = " AND ".join(f"`{k}` = %s" for k in key)
-    cur.execute(f"SELECT * FROM `{table}` WHERE {where}", tuple(key.values()))
-    row = cur.fetchone()
+    db = ctx.db
+    existing = db.scalars(select(model).filter_by(**key)).first()
 
-    if row is None:
-        all_cols = {**key, **cols, "last_scrape_run_id": ctx.run_id}
-        names = ", ".join(f"`{c}`" for c in all_cols)
-        marks = ", ".join(["%s"] * len(all_cols))
-        cur.execute(f"INSERT INTO `{table}` ({names}) VALUES ({marks})", tuple(all_cols.values()))
-        _replace_children(cur, cur.lastrowid, children)
+    if existing is None:
+        obj = model(**key, **cols, last_scrape_run_id=ctx.run_id)
+        db.add(obj)
+        db.flush()
+        _replace_children(db, obj.id, children)
         return "created"
 
-    pk = row["id"]
-    changed = any(row[c] != v for c, v in cols.items())
+    pk = existing.id
+    changed = any(getattr(existing, c) != v for c, v in cols.items())
     if not changed:
-        for child_table, fk, names, rows in children:
-            formated_names = ", ".join(f"`{n}`" for n in names)
-            cur.execute(
-                f"SELECT {formated_names} FROM `{child_table}` WHERE `{fk}` = %s",
-                (pk,),
-            )
-            if {tuple(r[n] for n in names) for r in cur.fetchall()} != rows:
+        for child_model, fk, names, rows in children:
+            child_cols = [getattr(child_model, n) for n in names]
+            fk_col = getattr(child_model, fk)
+            stored = {tuple(r) for r in db.execute(select(*child_cols).where(fk_col == pk)).all()}
+            if stored != rows:
                 changed = True
                 break
 
-    sets = ["last_seen_at = NOW()", "last_scrape_run_id = %s"]
-    args: list[Any] = [ctx.run_id]
+    existing.last_seen_at = func.now()  # type: ignore[assignment]
+    existing.last_scrape_run_id = ctx.run_id
     if changed:
-        sets += [f"`{c}` = %s" for c in cols]
-        args += list(cols.values())
-    cur.execute(f"UPDATE `{table}` SET {', '.join(sets)} WHERE id = %s", (*args, pk))
+        for c, v in cols.items():
+            setattr(existing, c, v)
+    db.flush()
     if changed:
-        _replace_children(cur, pk, children)
+        _replace_children(db, pk, children)
         return "updated"
     return "unchanged"
 
 
-def _replace_children(cur, pk: int, children: list[Child]) -> None:
-    for table, fk, names, rows in children:
-        cur.execute(f"DELETE FROM `{table}` WHERE `{fk}` = %s", (pk,))
+def _replace_children(db: Session, pk: int, children: list[Child]) -> None:
+    for child_model, fk, names, rows in children:
+        fk_col = getattr(child_model, fk)
+        db.execute(delete(child_model).where(fk_col == pk))
         if rows:
-            cols = ", ".join(f"`{n}`" for n in (fk, *names))
-            marks = ", ".join(["%s"] * (len(names) + 1))
-            cur.executemany(
-                f"INSERT INTO `{table}` ({cols}) VALUES ({marks})",
-                [(pk, *r) for r in sorted(rows, key=repr)],
-            )
+            for r in sorted(rows, key=repr):
+                db.add(child_model(**{fk: pk, **dict(zip(names, r, strict=True))}))
+    db.flush()
 
 
 def _clip(value: str | None, size: int) -> str | None:
@@ -248,20 +272,20 @@ def _load_instance(ctx: LoadContext, inst: InstanceRecord, data: Collected) -> s
     }
     children: list[Child] = [
         (
-            "instance_tag",
+            InstanceTag,
             "instance_pk",
             ("tag_key", "tag_value"),
             {(_clip(k, 128), _clip(v, 256)) for k, v in inst.tags.items()},
         ),
-        ("instance_security_group", "instance_pk", ("security_group_pk",), sg_pks),
+        (InstanceSecurityGroup, "instance_pk", ("security_group_pk",), sg_pks),
         (
-            "instance_volume",
+            InstanceVolume,
             "instance_pk",
             ("device_name", "volume_id", "size_gib", "volume_type"),
             {(v.device_name, v.volume_id, None, None) for v in inst.volumes},
         ),
         (
-            "instance_network_interface",
+            InstanceNetworkInterface,
             "instance_pk",
             ("eni_id", "subnet_pk", "private_ip", "public_ip"),
             {
@@ -275,7 +299,7 @@ def _load_instance(ctx: LoadContext, inst: InstanceRecord, data: Collected) -> s
         "region_id": ctx.region_pk,
         "instance_id": inst.instance_id,
     }
-    return _sync(ctx, "instance", key, cols, children)
+    return _sync(ctx, Instance, key, cols, children)
 
 
 def load_amis(ctx: LoadContext, data: Collected) -> Counts:
@@ -296,22 +320,22 @@ def _load_ami(ctx: LoadContext, ami: AmiRecord) -> str:
         "platform": ami.platform,
         "root_device_type": ami.root_device_type,
         "virtualization_type": ami.virtualization_type,
-        "is_public": int(ami.is_public),
+        "is_public": bool(ami.is_public),
         "deprecation_time": ami.deprecation_time,
     }
     children: list[Child] = [
         (
-            "ami_tag",
+            AmiTag,
             "ami_pk",
             ("tag_key", "tag_value"),
             {(_clip(k, 128), _clip(v, 256)) for k, v in ami.tags.items()},
         ),
         (
-            "ami_block_device_mapping",
+            AmiBlockDeviceMapping,
             "ami_pk",
             ("device_name", "snapshot_id", "size_gib"),
             {(b.device_name, b.snapshot_id, b.size_gib) for b in ami.block_mappings},
         ),
     ]
     key = {"account_id": ctx.account_pk, "region_id": ctx.region_pk, "image_id": ami.image_id}
-    return _sync(ctx, "ami", key, cols, children)
+    return _sync(ctx, Ami, key, cols, children)

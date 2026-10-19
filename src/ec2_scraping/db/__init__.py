@@ -5,6 +5,7 @@ from ec2_scraping.db.models import (
     AMI_STATE_VALUES,
     INSTANCE_STATE_VALUES,
     MONITORING_VALUES,
+    SCRAPE_SCOPE_STATUS_VALUES,
     SCRAPE_STATUS_VALUES,
     Account,
     Ami,
@@ -27,17 +28,23 @@ from ec2_scraping.db.models import (
     Vpc,
 )
 from ec2_scraping.db.session import (
+    DSN_ENV,
+    ConfigError,
+    connect,
     make_alembic_config,
     make_engine,
     make_session_factory,
     normalize_dsn,
+    parse_dsn,
     upgrade_db,
 )
 
 __all__ = [
     "AMI_STATE_VALUES",
+    "DSN_ENV",
     "INSTANCE_STATE_VALUES",
     "MONITORING_VALUES",
+    "SCRAPE_SCOPE_STATUS_VALUES",
     "SCRAPE_STATUS_VALUES",
     "Account",
     "Ami",
@@ -45,6 +52,7 @@ __all__ = [
     "AmiTag",
     "AvailabilityZone",
     "Base",
+    "ConfigError",
     "IamInstanceProfile",
     "Instance",
     "InstanceNetworkInterface",
@@ -61,9 +69,11 @@ __all__ = [
     "UBigInt",
     "UInt",
     "Vpc",
+    "connect",
     "make_alembic_config",
     "make_engine",
     "make_session_factory",
     "normalize_dsn",
+    "parse_dsn",
     "upgrade_db",
 ]

@@ -12,19 +12,18 @@ def new_run(db) -> int:
     return insert(db, "INSERT INTO scrape_run () VALUES ()")
 
 
-def do_load(db, data, run_id):
-    with db.cursor() as cur:
-        account = load.upsert_account(cur, "111111111111")
-        region = load.upsert_region(cur, "us-east-1")
-        ctx = load.LoadContext(cur, run_id, account, region)
-        counts = load.load_instances(ctx, data), load.load_amis(ctx, data)
-    db.commit()
+def do_load(conn, data, run_id):
+    account = load.upsert_account(conn, "111111111111")
+    region = load.upsert_region(conn, "us-east-1")
+    ctx = load.LoadContext(conn, run_id, account, region)
+    counts = load.load_instances(ctx, data), load.load_amis(ctx, data)
+    conn.commit()
     return counts
 
 
-def test_stores_all_instance_and_ami_attributes(db):
+def test_stores_all_instance_and_ami_attributes(conn, db):
     run = new_run(db)
-    ic, ac = do_load(db, collected(make_instance(), amis=(make_ami(),)), run)
+    ic, ac = do_load(conn, collected(make_instance(), amis=(make_ami(),)), run)
     assert (ic.created, ac.created) == (1, 1)
 
     inst = fetch(db, "SELECT * FROM instance")[0]
@@ -51,14 +50,14 @@ def test_stores_all_instance_and_ami_attributes(db):
     ]
 
 
-def test_reload_is_idempotent_and_advances_last_seen(db):
+def test_reload_is_idempotent_and_advances_last_seen(conn, db):
     data = collected(make_instance(), amis=(make_ami(),))
     run1, run2 = new_run(db), new_run(db)
-    do_load(db, data, run1)
+    do_load(conn, data, run1)
     insert(db, "UPDATE instance SET last_seen_at = '2020-01-01 00:00:00'")
     before = fetch(db, "SELECT first_seen_at FROM instance")[0]
 
-    ic, ac = do_load(db, data, run2)
+    ic, ac = do_load(conn, data, run2)
     assert (ic.unchanged, ic.updated, ic.created) == (1, 0, 0)
     assert (ac.unchanged, ac.updated, ac.created) == (1, 0, 0)
     after = fetch(db, "SELECT * FROM instance")[0]
@@ -69,9 +68,9 @@ def test_reload_is_idempotent_and_advances_last_seen(db):
     assert fetch(db, "SELECT last_scrape_run_id FROM ami")[0]["last_scrape_run_id"] == run2
 
 
-def test_removed_children_disappear_and_change_counts_as_updated(db):
+def test_removed_children_disappear_and_change_counts_as_updated(conn, db):
     run1, run2 = new_run(db), new_run(db)
-    do_load(db, collected(make_instance(), amis=(make_ami(),)), run1)
+    do_load(conn, collected(make_instance(), amis=(make_ami(),)), run1)
 
     smaller = make_instance(
         state="stopped",
@@ -81,7 +80,7 @@ def test_removed_children_disappear_and_change_counts_as_updated(db):
         network_interfaces=[],
     )
     ic, ac = do_load(
-        db, collected(smaller, amis=(make_ami(tags={"team": "a"}, block_mappings=[]),)), run2
+        conn, collected(smaller, amis=(make_ami(tags={"team": "a"}, block_mappings=[]),)), run2
     )
     assert (ic.updated, ac.updated) == (1, 1)
     assert fetch(db, "SELECT state FROM instance")[0]["state"] == "stopped"
@@ -93,14 +92,14 @@ def test_removed_children_disappear_and_change_counts_as_updated(db):
     assert fetch(db, "SELECT COUNT(*) AS n FROM ami_block_device_mapping")[0]["n"] == 0
 
 
-def test_instance_with_unknown_ami_is_stored(db):
+def test_instance_with_unknown_ami_is_stored(conn, db):
     inst = dataclasses.replace(make_instance(), image_id="ami-unknown")
-    ic, _ = do_load(db, collected(inst), new_run(db))
+    ic, _ = do_load(conn, collected(inst), new_run(db))
     assert ic.created == 1
     assert fetch(db, "SELECT COUNT(*) AS n FROM ami")[0]["n"] == 0
 
 
-def test_instance_without_optional_attributes(db):
+def test_instance_without_optional_attributes(conn, db):
     bare = make_instance(
         vpc_id=None,
         subnet_id=None,
@@ -112,7 +111,7 @@ def test_instance_without_optional_attributes(db):
         volumes=[],
         network_interfaces=[],
     )
-    ic, _ = do_load(db, collected(bare), new_run(db))
+    ic, _ = do_load(conn, collected(bare), new_run(db))
     row = fetch(db, "SELECT subnet_pk, key_pair_id, iam_instance_profile_id FROM instance")[0]
     assert ic.created == 1
     assert set(row.values()) == {None}

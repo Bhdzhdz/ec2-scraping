@@ -1,6 +1,7 @@
 """Shared builders and fakes for integration tests."""
 
 from datetime import datetime
+from typing import Any
 
 from botocore.exceptions import ClientError
 
@@ -16,7 +17,7 @@ from ec2_scraping.session import SsoLoginRequired
 
 
 def make_instance(instance_id: str = "i-1", **kw) -> InstanceRecord:
-    base = {
+    base: dict[str, Any] = {
         "instance_id": instance_id,
         "instance_type": "t3.micro",
         "availability_zone": "us-east-1a",
@@ -39,7 +40,7 @@ def make_instance(instance_id: str = "i-1", **kw) -> InstanceRecord:
 
 
 def make_ami(image_id: str = "ami-1", **kw) -> AmiRecord:
-    base = {
+    base: dict[str, Any] = {
         "image_id": image_id,
         "owner_aws_account_id": "111111111111",
         "state": "available",

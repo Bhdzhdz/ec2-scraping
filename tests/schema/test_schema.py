@@ -21,7 +21,9 @@ def test_reference_unique_keys(db):
 def test_scope_cascades_on_run_delete(db, ref):
     run = insert(db, "INSERT INTO scrape_run () VALUES ()")
     insert(
-        db, "INSERT INTO scrape_run_scope VALUES (%s, %s, %s)", (run, ref["account"], ref["region"])
+        db,
+        "INSERT INTO scrape_run_scope (scrape_run_id, account_id, region_id) VALUES (%s, %s, %s)",
+        (run, ref["account"], ref["region"]),
     )
     insert(db, "DELETE FROM scrape_run WHERE id = %s", (run,))
     with db.cursor() as cur:
