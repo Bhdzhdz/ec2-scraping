@@ -7,7 +7,7 @@ from sqlalchemy import engine_from_config, pool
 
 import ec2_scraping.db.models  # noqa: F401
 from ec2_scraping.db.base import Base
-from ec2_scraping.db.session import normalize_dsn
+from ec2_scraping.db.session import DEFAULT_SQLITE_DSN, normalize_dsn
 
 config = context.config
 target_metadata = Base.metadata
@@ -18,8 +18,9 @@ def _get_url() -> str:
     if not url:
         url = (
             os.environ.get("DATABASE_URL")
+            or os.environ.get("MARIADB_DSN")
             or os.environ.get("MARIADB_TEST_DSN")
-            or "mysql+pymysql://"
+            or DEFAULT_SQLITE_DSN
         )
     return normalize_dsn(url)
 

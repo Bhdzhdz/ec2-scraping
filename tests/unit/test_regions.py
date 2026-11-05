@@ -63,9 +63,10 @@ def test_missing_required_profile_is_usage_error():
     assert info.value.code == 64
 
 
-def test_missing_dsn_is_config_error(monkeypatch):
-    monkeypatch.delenv("MARIADB_DSN", raising=False)
-    assert cli.main(["run", "--profile", "p", "--region", "us-east-1"]) == 64
+def test_invalid_dsn_is_config_error():
+    assert (
+        cli.main(["run", "--profile", "p", "--region", "us-east-1", "--dsn", "postgres://x"]) == 64
+    )
 
 
 def test_load_instances_enrichers_runner_and_cli_summary(monkeypatch):

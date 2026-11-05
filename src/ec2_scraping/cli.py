@@ -24,7 +24,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--profile", action="append", required=True, help="AWS SSO profile")
     run_p.add_argument("--region", action="append", help="region (repeatable)")
     run_p.add_argument("--all-regions", action="store_true", help="all enabled regions")
-    run_p.add_argument("--dsn", help=f"database DSN (default env {db.DSN_ENV})")
+    run_p.add_argument(
+        "--dsn",
+        help=f"database DSN (default env {db.DSN_ENV}, falling back to {db.DEFAULT_SQLITE_DSN})",
+    )
     run_p.add_argument(
         "--ssh",
         action="store_true",

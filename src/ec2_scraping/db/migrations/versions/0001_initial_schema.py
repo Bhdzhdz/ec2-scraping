@@ -11,6 +11,7 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import mysql
 
+from ec2_scraping.db.base import UBigInt, UInt
 from ec2_scraping.db.models import (
     AMI_STATE_VALUES,
     INSTANCE_STATE_VALUES,
@@ -23,16 +24,31 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 _TABLE_OPTS = {"mysql_engine": "InnoDB", "mysql_charset": "utf8mb4"}
-UBigInt = mysql.BIGINT(unsigned=True)
-UInt = mysql.INTEGER(unsigned=True)
+
+
+def _enum(*values: str) -> sa.Enum:
+    return sa.Enum(*values, native_enum=True, validate_strings=True)
+
 
 VIEW_NAME = "v_instance_analytics"
-CREATE_VIEW_SQL = f"""
+CREATE_VIEW_MYSQL_SQL = f"""
 CREATE OR REPLACE VIEW {VIEW_NAME} AS
 SELECT
     i.*,
     TIMESTAMPDIFF(DAY, i.launch_time, i.last_seen_at) AS instance_age_days,
     TIMESTAMPDIFF(DAY, i.ami_creation_date, i.last_seen_at) AS ami_age_days,
+    (i.public_ip IS NOT NULL) AS has_public_ip,
+    (i.imds_http_tokens = 'required') AS is_imdsv2_enforced,
+    (i.ssh_status = 'succeeded') AS is_ssh_accessible
+FROM instance i
+"""
+
+CREATE_VIEW_SQLITE_SQL = f"""
+CREATE VIEW IF NOT EXISTS {VIEW_NAME} AS
+SELECT
+    i.*,
+    CAST(julianday(i.last_seen_at) - julianday(i.launch_time) AS INTEGER) AS instance_age_days,
+    CAST(julianday(i.last_seen_at) - julianday(i.ami_creation_date) AS INTEGER) AS ami_age_days,
     (i.public_ip IS NOT NULL) AS has_public_ip,
     (i.imds_http_tokens = 'required') AS is_imdsv2_enforced,
     (i.ssh_status = 'succeeded') AS is_ssh_accessible
@@ -49,7 +65,7 @@ def upgrade() -> None:
         sa.Column("availability_zone", sa.String(32), nullable=False),
         sa.Column("instance_id", sa.String(32), nullable=False),
         sa.Column("name", sa.String(256), nullable=True),
-        sa.Column("state", mysql.ENUM(*INSTANCE_STATE_VALUES), nullable=False),
+        sa.Column("state", _enum(*INSTANCE_STATE_VALUES), nullable=False),
         sa.Column("state_reason_code", sa.String(64), nullable=True),
         sa.Column("state_transition_reason", sa.String(255), nullable=True),
         sa.Column(
@@ -72,7 +88,7 @@ def upgrade() -> None:
         sa.Column("usage_operation", sa.String(64), nullable=True),
         sa.Column(
             "monitoring",
-            mysql.ENUM(*MONITORING_VALUES),
+            _enum(*MONITORING_VALUES),
             nullable=False,
             server_default=sa.text("'disabled'"),
         ),
@@ -104,7 +120,7 @@ def upgrade() -> None:
         sa.Column("ami_name", sa.String(255), nullable=True),
         sa.Column("ami_description", sa.String(1024), nullable=True),
         sa.Column("ami_creation_date", sa.DateTime(), nullable=True),
-        sa.Column("ami_state", mysql.ENUM(*AMI_STATE_VALUES), nullable=True),
+        sa.Column("ami_state", _enum(*AMI_STATE_VALUES), nullable=True),
         sa.Column("ami_architecture", sa.String(16), nullable=True),
         sa.Column("ami_platform", sa.String(32), nullable=True),
         sa.Column("ami_platform_details", sa.String(64), nullable=True),
@@ -184,7 +200,11 @@ def upgrade() -> None:
         if_not_exists=True,
         **_TABLE_OPTS,
     )
-    op.execute(CREATE_VIEW_SQL)
+    if op.get_bind().dialect.name == "sqlite":
+        op.execute(f"DROP VIEW IF EXISTS {VIEW_NAME}")
+        op.execute(CREATE_VIEW_SQLITE_SQL)
+    else:
+        op.execute(CREATE_VIEW_MYSQL_SQL)
 
 
 def downgrade() -> None:

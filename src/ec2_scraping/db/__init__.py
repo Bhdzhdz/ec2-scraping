@@ -8,6 +8,7 @@ from ec2_scraping.db.models import (
     Instance,
 )
 from ec2_scraping.db.session import (
+    DEFAULT_SQLITE_DSN,
     DSN_ENV,
     ConfigError,
     connect,
@@ -21,6 +22,7 @@ from ec2_scraping.db.session import (
 
 __all__ = [
     "AMI_STATE_VALUES",
+    "DEFAULT_SQLITE_DSN",
     "DSN_ENV",
     "INSTANCE_STATE_VALUES",
     "MONITORING_VALUES",

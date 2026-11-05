@@ -3,8 +3,8 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, Index, String, Text, UniqueConstraint, text
-from sqlalchemy.dialects.mysql import CHAR, ENUM
+from sqlalchemy import JSON, Boolean, DateTime, Enum, Index, String, Text, UniqueConstraint, text
+from sqlalchemy.dialects.mysql import CHAR
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ec2_scraping.db.base import Base, UBigInt, UInt
@@ -32,6 +32,10 @@ AMI_STATE_VALUES = (
 )
 
 
+def _enum(*values: str) -> Enum:
+    return Enum(*values, native_enum=True, validate_strings=True)
+
+
 class Instance(Base):
     """Wide analytical EC2 instance inventory row (one row per instance on a single table)."""
 
@@ -47,7 +51,11 @@ class Instance(Base):
     )
 
     # 1. Identity & Placement
-    id: Mapped[int] = mapped_column(UBigInt, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(
+        UBigInt,
+        primary_key=True,
+        autoincrement=True,
+    )
     aws_account_id: Mapped[str] = mapped_column(CHAR(12), nullable=False)
     region: Mapped[str] = mapped_column(String(32), nullable=False)
     availability_zone: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -55,7 +63,7 @@ class Instance(Base):
     name: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     # 2. State, Lifecycle & Scheduling
-    state: Mapped[str] = mapped_column(ENUM(*INSTANCE_STATE_VALUES), nullable=False)
+    state: Mapped[str] = mapped_column(_enum(*INSTANCE_STATE_VALUES), nullable=False)
     state_reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     state_transition_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     lifecycle: Mapped[str] = mapped_column(
@@ -71,7 +79,7 @@ class Instance(Base):
     launch_time: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     usage_operation: Mapped[str | None] = mapped_column(String(64), nullable=True)
     monitoring: Mapped[str] = mapped_column(
-        ENUM(*MONITORING_VALUES), nullable=False, server_default=text("'disabled'")
+        _enum(*MONITORING_VALUES), nullable=False, server_default=text("'disabled'")
     )
 
     # 3. Compute, Hardware & Instance Type Specs
@@ -105,7 +113,7 @@ class Instance(Base):
     ami_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     ami_description: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     ami_creation_date: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    ami_state: Mapped[str | None] = mapped_column(ENUM(*AMI_STATE_VALUES), nullable=True)
+    ami_state: Mapped[str | None] = mapped_column(_enum(*AMI_STATE_VALUES), nullable=True)
     ami_architecture: Mapped[str | None] = mapped_column(String(16), nullable=True)
     ami_platform: Mapped[str | None] = mapped_column(String(32), nullable=True)
     ami_platform_details: Mapped[str | None] = mapped_column(String(64), nullable=True)
