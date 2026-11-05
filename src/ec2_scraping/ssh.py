@@ -10,17 +10,10 @@ import asyncssh
 from ec2_scraping.models import EnrichmentResult, InstanceRecord
 
 DEFAULT_SSH_USERS: tuple[str, ...] = (
-    "ec2-user",
-    "ubuntu",
-    "admin",
-    "centos",
-    "debian",
-    "fedora",
-    "rocky",
-    "almalinux",
-    "suse",
-    "bitnami",
     "root",
+    "admin",
+    "ec2-user",
+    "centos",
 )
 
 DEFAULT_KEY_NAMES: tuple[str, ...] = (
