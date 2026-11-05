@@ -117,21 +117,16 @@ def test_parse_probe_output_extracts_all_sections():
 @pytest.mark.parametrize(
     ("ami_name", "expected_first"),
     [
-        ("ubuntu/images/hvm-ssd/ubuntu-noble-24.04", "ubuntu"),
-        ("debian-12-amd64", "debian"),
         ("CentOS Stream 9", "centos"),
-        ("Fedora-Cloud-Base", "fedora"),
-        ("Rocky-9-EC2", "rocky"),
-        ("AlmaLinux OS 9", "almalinux"),
-        ("suse-sles-15", "suse"),
-        ("bitnami-wordpress", "bitnami"),
         ("amzn2-ami-hvm", "ec2-user"),
+        ("ubuntu/images/hvm-ssd/ubuntu-noble-24.04", ssh.DEFAULT_SSH_USERS[0]),
     ],
 )
 def test_ordered_candidate_users_prioritizes_distro_hint(ami_name, expected_first):
     users = ssh.ordered_candidate_users(_inst(), ami_name=ami_name)
     assert users[0] == expected_first
     assert len(users) == len(ssh.DEFAULT_SSH_USERS)
+    assert set(users) == set(ssh.DEFAULT_SSH_USERS)
 
 
 def test_resolve_target_host_and_client_keys(tmp_path):

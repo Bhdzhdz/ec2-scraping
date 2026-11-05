@@ -162,7 +162,7 @@ def ordered_candidate_users(
 
     ordered: list[str] = []
     for u in (*prioritized, *users):
-        if u and u not in ordered:
+        if u and u in users and u not in ordered:
             ordered.append(u)
     return ordered
 
