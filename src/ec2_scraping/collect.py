@@ -16,7 +16,15 @@ from ec2_scraping.models import (
 )
 
 BATCH = 100
-_TOLERATED = {"InvalidAMIID.NotFound", "InvalidAMIID.Unavailable", "InvalidAMIID.Malformed"}
+_TOLERATED = {
+    "InvalidAMIID.Malformed",
+    "InvalidAMIID.NotFound",
+    "InvalidAMIID.Unavailable",
+    "InvalidInstanceType",
+    "InvalidSubnetID.NotFound",
+    "InvalidVolume.NotFound",
+    "InvalidVpcID.NotFound",
+}
 
 
 def _naive_utc(value) -> datetime | None:
@@ -187,21 +195,49 @@ def map_volume(raw: dict) -> VolumeInfo:
     )
 
 
-def _fetch_images(ec2, image_ids: list[str]) -> list[dict]:
-    """Describe referenced AMIs; tolerate ones that are missing or not visible."""
+def _error_code(exc: ClientError) -> str | None:
+    return exc.response.get("Error", {}).get("Code")
+
+
+def _fetch_batch(
+    ec2,
+    operation: str,
+    param_name: str,
+    result_key: str,
+    items: list[str],
+    *,
+    use_paginator: bool = True,
+) -> list[dict]:
+    """Describe a batch of resource IDs; fall back to single-item calls on tolerated errors."""
+
+    def _call(ids: list[str]) -> list[dict]:
+        if use_paginator:
+            out: list[dict] = []
+            for page in ec2.get_paginator(operation).paginate(**{param_name: ids}):
+                out.extend(page.get(result_key, []))
+            return out
+        return getattr(ec2, operation)(**{param_name: ids}).get(result_key, [])
+
     try:
-        return ec2.describe_images(ImageIds=image_ids)["Images"]
+        return _call(items)
     except ClientError as exc:
-        if exc.response["Error"]["Code"] not in _TOLERATED:
+        if _error_code(exc) not in _TOLERATED:
             raise
     found: list[dict] = []
-    for image_id in image_ids:
+    for item in items:
         try:
-            found += ec2.describe_images(ImageIds=[image_id])["Images"]
+            found.extend(_call([item]))
         except ClientError as exc:
-            if exc.response["Error"]["Code"] not in _TOLERATED:
+            if _error_code(exc) not in _TOLERATED:
                 raise
     return found
+
+
+def _fetch_images(ec2, image_ids: list[str]) -> list[dict]:
+    """Describe referenced AMIs; tolerate ones that are missing or not visible."""
+    return _fetch_batch(
+        ec2, "describe_images", "ImageIds", "Images", image_ids, use_paginator=False
+    )
 
 
 def collect(ec2, account_id: str) -> Collected:
@@ -218,24 +254,24 @@ def collect(ec2, account_id: str) -> Collected:
             data.amis[raw["ImageId"]] = map_ami(raw)
 
     for batch in _batches(i.instance_type for i in data.instances):
-        for page in ec2.get_paginator("describe_instance_types").paginate(InstanceTypes=batch):
-            for t in page["InstanceTypes"]:
-                data.type_info[t["InstanceType"]] = map_type_info(t)
+        for t in _fetch_batch(
+            ec2, "describe_instance_types", "InstanceTypes", "InstanceTypes", batch
+        ):
+            data.type_info[t["InstanceType"]] = map_type_info(t)
 
     volume_ids = {v.volume_id for i in data.instances for v in i.volumes}
     for batch in _batches(volume_ids):
-        for page in ec2.get_paginator("describe_volumes").paginate(VolumeIds=batch):
-            for v in page["Volumes"]:
-                data.volume_info[v["VolumeId"]] = map_volume(v)
+        for v in _fetch_batch(ec2, "describe_volumes", "VolumeIds", "Volumes", batch):
+            data.volume_info[v["VolumeId"]] = map_volume(v)
 
     vpc_ids = {i.vpc_id for i in data.instances if i.vpc_id}
     for batch in _batches(vpc_ids):
-        for page in ec2.get_paginator("describe_vpcs").paginate(VpcIds=batch):
-            data.vpc_cidrs.update({v["VpcId"]: v["CidrBlock"] for v in page["Vpcs"]})
+        for v in _fetch_batch(ec2, "describe_vpcs", "VpcIds", "Vpcs", batch):
+            data.vpc_cidrs[v["VpcId"]] = v["CidrBlock"]
 
     subnet_ids = {i.subnet_id for i in data.instances if i.subnet_id}
     for batch in _batches(subnet_ids):
-        for page in ec2.get_paginator("describe_subnets").paginate(SubnetIds=batch):
-            data.subnet_cidrs.update({s["SubnetId"]: s["CidrBlock"] for s in page["Subnets"]})
+        for s in _fetch_batch(ec2, "describe_subnets", "SubnetIds", "Subnets", batch):
+            data.subnet_cidrs[s["SubnetId"]] = s["CidrBlock"]
 
     return data

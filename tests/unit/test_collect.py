@@ -242,6 +242,109 @@ def test_unexpected_ami_error_is_not_swallowed():
             collect(ec2, ACCOUNT)
 
 
+def test_tolerated_client_errors_fall_back_per_item():
+    ec2 = _client()
+    inst1 = _full_instance()
+    inst2 = {
+        **_minimal_instance(),
+        "VpcId": "vpc-missing",
+        "SubnetId": "subnet-missing",
+        "BlockDeviceMappings": [
+            {
+                "DeviceName": "/dev/xvda",
+                "Ebs": {"VolumeId": "vol-missing", "DeleteOnTermination": True},
+            }
+        ],
+    }
+    with Stubber(ec2) as stub:
+        stub.add_response(
+            "describe_instances",
+            {"Reservations": [{"Instances": [inst1, inst2]}]},
+            {},
+        )
+        stub.add_response("describe_images", {"Images": [_ami()]}, {"ImageIds": ["ami-1", "ami-9"]})
+
+        # describe_instance_types fails on batch, succeeds for g4dn.xlarge, skips t3.small
+        stub.add_client_error(
+            "describe_instance_types",
+            "InvalidInstanceType",
+            expected_params={"InstanceTypes": ["g4dn.xlarge", "t3.small"]},
+        )
+        stub.add_response(
+            "describe_instance_types",
+            {"InstanceTypes": [{"InstanceType": "g4dn.xlarge", "VCpuInfo": {"DefaultVCpus": 4}}]},
+            {"InstanceTypes": ["g4dn.xlarge"]},
+        )
+        stub.add_client_error(
+            "describe_instance_types",
+            "InvalidInstanceType",
+            expected_params={"InstanceTypes": ["t3.small"]},
+        )
+
+        # describe_volumes fails on batch, succeeds for vol-1, skips vol-missing
+        stub.add_client_error(
+            "describe_volumes",
+            "InvalidVolume.NotFound",
+            expected_params={"VolumeIds": ["vol-1", "vol-missing"]},
+        )
+        stub.add_response(
+            "describe_volumes",
+            {
+                "Volumes": [
+                    {"VolumeId": "vol-1", "Size": 50, "VolumeType": "gp3", "Encrypted": True}
+                ]
+            },
+            {"VolumeIds": ["vol-1"]},
+        )
+        stub.add_client_error(
+            "describe_volumes",
+            "InvalidVolume.NotFound",
+            expected_params={"VolumeIds": ["vol-missing"]},
+        )
+
+        # describe_vpcs fails on batch, succeeds for vpc-1, tolerated error for vpc-missing
+        stub.add_client_error(
+            "describe_vpcs",
+            "InvalidVpcID.NotFound",
+            expected_params={"VpcIds": ["vpc-1", "vpc-missing"]},
+        )
+        stub.add_response(
+            "describe_vpcs",
+            {"Vpcs": [{"VpcId": "vpc-1", "CidrBlock": "10.0.0.0/16"}]},
+            {"VpcIds": ["vpc-1"]},
+        )
+        stub.add_client_error(
+            "describe_vpcs",
+            "InvalidVpcID.NotFound",
+            expected_params={"VpcIds": ["vpc-missing"]},
+        )
+
+        # describe_subnets fails on batch, succeeds for subnet-1, tolerated error for subnet-missing
+        stub.add_client_error(
+            "describe_subnets",
+            "InvalidSubnetID.NotFound",
+            expected_params={"SubnetIds": ["subnet-1", "subnet-missing"]},
+        )
+        stub.add_response(
+            "describe_subnets",
+            {"Subnets": [{"SubnetId": "subnet-1", "CidrBlock": "10.0.0.0/24"}]},
+            {"SubnetIds": ["subnet-1"]},
+        )
+        stub.add_client_error(
+            "describe_subnets",
+            "InvalidSubnetID.NotFound",
+            expected_params={"SubnetIds": ["subnet-missing"]},
+        )
+
+        data = collect(ec2, ACCOUNT)
+        stub.assert_no_pending_responses()
+
+    assert list(data.type_info) == ["g4dn.xlarge"]
+    assert list(data.volume_info) == ["vol-1"]
+    assert data.vpc_cidrs == {"vpc-1": "10.0.0.0/16"}
+    assert data.subnet_cidrs == {"subnet-1": "10.0.0.0/24"}
+
+
 def test_clients_use_adaptive_retries():
     calls = []
 
