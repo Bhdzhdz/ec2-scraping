@@ -1,32 +1,24 @@
-"""Scrape-run lifecycle with per-combination isolation and atomic loads."""
+"""Scrape lifecycle with per-combination isolation, pluggable enrichers, and atomic loads."""
 
 import sys
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Callable, Sequence
 
 from botocore.exceptions import ClientError, EndpointConnectionError
-from sqlalchemy import func, update
-from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Session
 
 from ec2_scraping import collect as collect_mod
 from ec2_scraping import load, session
-from ec2_scraping.db.models import ScrapeRun, ScrapeRunScope
-from ec2_scraping.models import ComboResult, Counts, RunResult
+from ec2_scraping.models import (
+    Collected,
+    ComboResult,
+    Counts,
+    EnrichmentResult,
+    InstanceEnricher,
+    RunResult,
+)
 
 # Errors meaning "this region is not usable for the account" (stored as skipped).
 _DISABLED_CODES = {"AuthFailure", "OptInRequired"}
-
-
-def sweep_stale_runs(db: Session) -> int:
-    """Mark runs left `running` by a crashed process as failed (single-process assumption)."""
-    res: Any = db.execute(
-        update(ScrapeRun)
-        .where(ScrapeRun.status == "running")
-        .values(status="failed", finished_at=func.now())
-    )
-    db.commit()
-    return int(res.rowcount or 0)
 
 
 def _classify(exc: Exception) -> str:
@@ -40,47 +32,75 @@ def _classify(exc: Exception) -> str:
     return "failed"
 
 
-def _record_scope(
-    db: Session, run_id: int, account_pk: int, region_pk: int, status: str, error: str | None
-) -> None:
-    stmt = mysql_insert(ScrapeRunScope).values(
-        scrape_run_id=run_id,
-        account_id=account_pk,
-        region_id=region_pk,
-        status=status,
-        error=error,
-    )
-    db.execute(
-        stmt.on_duplicate_key_update(
-            status=stmt.inserted.status,
-            error=stmt.inserted.error,
-        )
-    )
+def _run_enrichers(
+    db: Session,
+    aws_account_id: str,
+    region: str,
+    data: Collected,
+    enrichers: Sequence[InstanceEnricher],
+) -> dict[str, dict[str, EnrichmentResult]]:
+    if not enrichers or not data.instances:
+        return {}
+    results: dict[str, dict[str, EnrichmentResult]] = {
+        inst.instance_id: {} for inst in data.instances
+    }
+    ami_names = {k: v.name for k, v in data.amis.items()}
+    for enricher in enrichers:
+        targets = data.instances
+        if enricher.name == "ssh" and getattr(enricher, "only_unaccessed", False):
+            already_accessed = load.get_accessed_ssh_instance_ids(
+                db, aws_account_id, region, [i.instance_id for i in data.instances]
+            )
+            targets = [i for i in data.instances if i.instance_id not in already_accessed]
+            if not targets:
+                continue
+
+        batch_fn = getattr(enricher, "enrich_batch", None)
+        if callable(batch_fn):
+            try:
+                batch_res = batch_fn(aws_account_id, region, targets, ami_names)
+                for inst_id, res in batch_res.items():
+                    if inst_id in results:
+                        results[inst_id][enricher.name] = res
+                continue
+            except Exception as exc:
+                err = f"{type(exc).__name__}: {exc}"
+                for inst in targets:
+                    results[inst.instance_id][enricher.name] = EnrichmentResult(
+                        status="failed", error=err
+                    )
+                continue
+
+        for inst in targets:
+            try:
+                results[inst.instance_id][enricher.name] = enricher.enrich(
+                    aws_account_id, region, inst
+                )
+            except Exception as exc:
+                results[inst.instance_id][enricher.name] = EnrichmentResult(
+                    status="failed", error=f"{type(exc).__name__}: {exc}"
+                )
+    return results
 
 
-def _scrape_combo(db: Session, run_id: int, ps, region: str, collect_fn: Callable) -> ComboResult:
+def _scrape_combo(
+    db: Session,
+    ps,
+    region: str,
+    collect_fn: Callable,
+    enrichers: Sequence[InstanceEnricher] = (),
+) -> ComboResult:
     result = ComboResult(ps.profile, region, "succeeded")
     try:
         data = collect_fn(ps.ec2(region), ps.account_id)  # no DB writes before this succeeds
-        account_pk = load.upsert_account(db, ps.account_id)
-        region_pk = load.upsert_region(db, region)
-        ctx = load.LoadContext(db, run_id, account_pk, region_pk)
-        result.instances = load.load_instances(ctx, data)
-        result.amis = load.load_amis(ctx, data)
-        _record_scope(db, run_id, account_pk, region_pk, "succeeded", None)
+        enrichments = _run_enrichers(db, ps.account_id, region, data, enrichers)
+        result.instances = load.load_instances(db, ps.account_id, region, data, enrichments)
         db.commit()
         return result
     except Exception as exc:
         db.rollback()
         result.status, result.error = _classify(exc), f"{type(exc).__name__}: {exc}"
-        result.instances, result.amis = Counts(), Counts()
-        try:  # best effort: remember the failed attempt for the missing-resources logic
-            account_pk = load.upsert_account(db, ps.account_id)
-            region_pk = load.upsert_region(db, region)
-            _record_scope(db, run_id, account_pk, region_pk, result.status, result.error)
-            db.commit()
-        except Exception:
-            db.rollback()
+        result.instances = Counts()
         return result
 
 
@@ -99,44 +119,28 @@ def run(
     *,
     open_session: Callable = session.open_session,
     collect_fn: Callable = collect_mod.collect,
+    enrichers: Sequence[InstanceEnricher] = (),
     progress=sys.stderr,
 ) -> RunResult:
-    """Scrape every profile/region combination under one `scrape_run` row."""
-    sweep_stale_runs(db)
-    scrape_run = ScrapeRun(status="running")
-    db.add(scrape_run)
-    db.commit()
-    run_id = scrape_run.id
-
-    result = RunResult(run_id, "failed")
-    final = "failed"  # stays failed if interrupted (e.g. KeyboardInterrupt)
-    try:
-        for profile in profiles:
-            try:
-                ps = open_session(profile)
-                targets = session.resolve_regions(ps, regions, all_regions)
-                if not targets:
-                    raise ValueError("no region given and the profile has no default region")
-            except session.SsoLoginRequired as exc:
-                result.combos.append(ComboResult(profile, None, "skipped", str(exc)))
-                continue
-            except Exception as exc:
-                result.combos.append(
-                    ComboResult(profile, None, "failed", f"{type(exc).__name__}: {exc}")
-                )
-                continue
-            for region in targets:
-                combo = _scrape_combo(db, run_id, ps, region, collect_fn)
-                result.combos.append(combo)
-                print(f"{profile}/{region}: {combo.status}", file=progress)
-        final = _run_status(result.combos)
-        result.status = final
-        return result
-    finally:
-        db.rollback()
-        db.execute(
-            update(ScrapeRun)
-            .where(ScrapeRun.id == run_id)
-            .values(status=final, finished_at=func.now())
-        )
-        db.commit()
+    """Scrape every profile/region combination into the `instance` table."""
+    result = RunResult("failed")
+    for profile in profiles:
+        try:
+            ps = open_session(profile)
+            targets = session.resolve_regions(ps, regions, all_regions)
+            if not targets:
+                raise ValueError("no region given and the profile has no default region")
+        except session.SsoLoginRequired as exc:
+            result.combos.append(ComboResult(profile, None, "skipped", str(exc)))
+            continue
+        except Exception as exc:
+            result.combos.append(
+                ComboResult(profile, None, "failed", f"{type(exc).__name__}: {exc}")
+            )
+            continue
+        for region in targets:
+            combo = _scrape_combo(db, ps, region, collect_fn, enrichers)
+            result.combos.append(combo)
+            print(f"{profile}/{region}: {combo.status}", file=progress)
+    result.status = _run_status(result.combos)
+    return result

@@ -61,38 +61,20 @@ def fetch(conn, sql: str, args=()) -> list[dict]:
         return list(cur.fetchall())
 
 
-@pytest.fixture
-def ref(db) -> dict:
-    """Minimal reference rows shared by instance/AMI tests."""
-    account = insert(db, "INSERT INTO account (aws_account_id) VALUES ('111111111111')")
-    region = insert(db, "INSERT INTO region (code) VALUES ('us-east-1')")
-    az = insert(
-        db, "INSERT INTO availability_zone (region_id, name) VALUES (%s, 'us-east-1a')", (region,)
-    )
-    itype = insert(db, "INSERT INTO instance_type (name) VALUES ('t3.micro')")
-    vpc = insert(
-        db,
-        "INSERT INTO vpc (account_id, region_id, vpc_id) VALUES (%s, %s, 'vpc-1')",
-        (account, region),
-    )
-    subnet = insert(
-        db,
-        "INSERT INTO subnet (vpc_pk, availability_zone_id, subnet_id) VALUES (%s, %s, 'subnet-1')",
-        (vpc, az),
-    )
-    sg = insert(db, "INSERT INTO security_group (vpc_pk, group_id) VALUES (%s, 'sg-1')", (vpc,))
-    return dict(account=account, region=region, az=az, itype=itype, vpc=vpc, subnet=subnet, sg=sg)
-
-
 def add_instance(
-    conn, ref: dict, instance_id: str = "i-1", image_id: str = "ami-1", **extra
+    conn,
+    instance_id: str = "i-1",
+    image_id: str = "ami-1",
+    aws_account_id: str = "111111111111",
+    region: str = "us-east-1",
+    **extra,
 ) -> int:
     cols = dict(
-        account_id=ref["account"],
-        region_id=ref["region"],
+        aws_account_id=aws_account_id,
+        region=region,
         instance_id=instance_id,
-        instance_type_id=ref["itype"],
-        availability_zone_id=ref["az"],
+        instance_type="t3.micro",
+        availability_zone="us-east-1a",
         image_id=image_id,
         state="running",
         architecture="x86_64",
@@ -102,20 +84,3 @@ def add_instance(
     names = ", ".join(cols)
     marks = ", ".join(["%s"] * len(cols))
     return insert(conn, f"INSERT INTO instance ({names}) VALUES ({marks})", tuple(cols.values()))
-
-
-def add_ami(conn, ref: dict, image_id: str = "ami-1", **extra) -> int:
-    cols = dict(
-        account_id=ref["account"],
-        region_id=ref["region"],
-        image_id=image_id,
-        owner_aws_account_id="111111111111",
-        state="available",
-        architecture="x86_64",
-        root_device_type="ebs",
-        virtualization_type="hvm",
-    )
-    cols.update(extra)
-    names = ", ".join(cols)
-    marks = ", ".join(["%s"] * len(cols))
-    return insert(conn, f"INSERT INTO ami ({names}) VALUES ({marks})", tuple(cols.values()))

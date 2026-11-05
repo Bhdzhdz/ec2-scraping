@@ -4,85 +4,80 @@ import pytest
 from .conftest import add_instance, fetch, insert
 
 
-def test_round_trip_all_attributes(db, ref):
-    key = insert(
-        db,
-        "INSERT INTO key_pair (account_id, region_id, name) VALUES (%s, %s, 'k')",
-        (ref["account"], ref["region"]),
-    )
-    prof = insert(
-        db,
-        "INSERT INTO iam_instance_profile (account_id, region_id, arn) VALUES (%s, %s, 'arn:p')",
-        (ref["account"], ref["region"]),
-    )
+def test_round_trip_all_attributes(db):
     pk = add_instance(
         db,
-        ref,
-        subnet_pk=ref["subnet"],
-        key_pair_id=key,
-        iam_instance_profile_id=prof,
+        name="web",
+        vcpu=2,
+        memory_mib=1024,
+        vpc_id="vpc-1",
+        vpc_cidr="10.0.0.0/16",
+        subnet_id="subnet-1",
+        subnet_cidr="10.0.0.0/24",
+        key_name="k",
+        iam_instance_profile_arn="arn:p",
         platform="windows",
         private_ip="10.0.0.1",
         public_ip="1.2.3.4",
         monitoring="enabled",
+        ami_owner_aws_account_id="111111111111",
+        ami_name="base",
+        ami_description="desc",
+        ami_creation_date="2026-01-01 00:00:00",
+        ami_state="available",
+        ami_architecture="x86_64",
+        ami_platform="windows",
+        ami_root_device_type="ebs",
+        ami_virtualization_type="hvm",
+        ami_is_public=1,
+        ami_deprecation_time="2027-01-01 00:00:00",
     )
     row = fetch(db, "SELECT * FROM instance WHERE id = %s", (pk,))[0]
+    assert row["name"] == "web"
+    assert row["vcpu"] == 2 and row["memory_mib"] == 1024
+    assert row["vpc_id"] == "vpc-1" and row["vpc_cidr"] == "10.0.0.0/16"
+    assert row["subnet_id"] == "subnet-1" and row["subnet_cidr"] == "10.0.0.0/24"
     assert row["state"] == "running" and row["architecture"] == "x86_64"
     assert row["platform"] == "windows" and row["monitoring"] == "enabled"
     assert row["private_ip"] == "10.0.0.1" and row["public_ip"] == "1.2.3.4"
-    assert row["key_pair_id"] == key and row["iam_instance_profile_id"] == prof
-    assert row["subnet_pk"] == ref["subnet"] and row["image_id"] == "ami-1"
+    assert row["key_name"] == "k" and row["iam_instance_profile_arn"] == "arn:p"
+    assert row["image_id"] == "ami-1" and row["ami_name"] == "base"
+    assert row["ami_owner_aws_account_id"] == "111111111111" and row["ami_is_public"] == 1
 
 
-def test_optional_fields_nullable(db, ref):
-    pk = add_instance(db, ref)
+def test_optional_fields_nullable(db):
+    pk = add_instance(db)
     row = fetch(db, "SELECT * FROM instance WHERE id = %s", (pk,))[0]
-    for col in ("key_pair_id", "iam_instance_profile_id", "public_ip", "platform", "subnet_pk"):
+    for col in (
+        "name",
+        "vcpu",
+        "memory_mib",
+        "vpc_id",
+        "vpc_cidr",
+        "subnet_id",
+        "subnet_cidr",
+        "key_name",
+        "iam_instance_profile_arn",
+        "public_ip",
+        "platform",
+        "ami_owner_aws_account_id",
+        "ami_name",
+        "ami_state",
+    ):
         assert row[col] is None
 
 
-def test_duplicate_rejected_and_upsert_in_place(db, ref):
-    add_instance(db, ref)
+def test_duplicate_rejected_and_upsert_in_place(db):
+    add_instance(db)
     with pytest.raises(pymysql.err.IntegrityError):
-        add_instance(db, ref)
+        add_instance(db)
     insert(
         db,
-        "INSERT INTO instance (account_id, region_id, instance_id, instance_type_id,"
-        " availability_zone_id, image_id, state, architecture, launch_time)"
-        " VALUES (%s, %s, 'i-1', %s, %s, 'ami-1', 'stopped', 'x86_64', '2026-01-01')"
+        "INSERT INTO instance (aws_account_id, region, instance_id, instance_type,"
+        " availability_zone, image_id, state, architecture, launch_time)"
+        " VALUES ('111111111111', 'us-east-1', 'i-1', 't3.micro', 'us-east-1a',"
+        " 'ami-1', 'stopped', 'x86_64', '2026-01-01')"
         " ON DUPLICATE KEY UPDATE state = VALUES(state)",
-        (ref["account"], ref["region"], ref["itype"], ref["az"]),
     )
     rows = fetch(db, "SELECT state FROM instance")
     assert rows == [{"state": "stopped"}]
-
-
-def test_tags_and_cascade(db, ref):
-    pk = add_instance(db, ref)
-    insert(db, "INSERT INTO instance_tag VALUES (%s, 'Env', 'prod')", (pk,))
-    insert(db, "INSERT INTO instance_tag VALUES (%s, 'Team', 'a')", (pk,))
-    insert(db, "INSERT INTO instance_security_group VALUES (%s, %s)", (pk, ref["sg"]))
-    insert(
-        db,
-        "INSERT INTO instance_volume (instance_pk, device_name, volume_id, size_gib) VALUES (%s, '/dev/sda1', 'vol-1', 8)",
-        (pk,),
-    )
-    insert(
-        db,
-        "INSERT INTO instance_network_interface (instance_pk, eni_id) VALUES (%s, 'eni-1')",
-        (pk,),
-    )
-    found = fetch(
-        db, "SELECT instance_pk FROM instance_tag WHERE tag_key='Env' AND tag_value='prod'"
-    )
-    assert found == [{"instance_pk": pk}]
-    with pytest.raises(pymysql.err.IntegrityError):
-        insert(db, "INSERT INTO instance_tag VALUES (%s, 'Env', 'x')", (pk,))
-    insert(db, "DELETE FROM instance WHERE id = %s", (pk,))
-    for table in (
-        "instance_tag",
-        "instance_security_group",
-        "instance_volume",
-        "instance_network_interface",
-    ):
-        assert fetch(db, f"SELECT COUNT(*) AS n FROM {table}")[0]["n"] == 0

@@ -22,28 +22,67 @@ def _client():
 def _full_instance():
     return {
         "InstanceId": "i-1",
-        "InstanceType": "t3.micro",
+        "InstanceType": "g4dn.xlarge",
         "ImageId": "ami-1",
         "State": {"Name": "running"},
+        "StateReason": {"Code": "Server.SpotInstanceTermination"},
+        "StateTransitionReason": "User initiated",
+        "InstanceLifecycle": "spot",
+        "SpotInstanceRequestId": "sir-1",
+        "CapacityReservationId": "cr-1",
         "Architecture": "x86_64",
         "LaunchTime": LAUNCH,
-        "Placement": {"AvailabilityZone": "us-east-1a"},
+        "UsageOperation": "RunInstances",
+        "Placement": {
+            "AvailabilityZone": "us-east-1a",
+            "Tenancy": "dedicated",
+            "GroupName": "pg-1",
+            "HostId": "h-1",
+        },
+        "CpuOptions": {"CoreCount": 2, "ThreadsPerCore": 2},
+        "Hypervisor": "nitro",
+        "VirtualizationType": "hvm",
+        "EnaSupport": True,
+        "SriovNetSupport": "simple",
+        "BootMode": "uefi",
+        "TpmSupport": "v2.0",
+        "Platform": "windows",
+        "PlatformDetails": "Windows",
         "VpcId": "vpc-1",
         "SubnetId": "subnet-1",
         "KeyName": "k",
         "IamInstanceProfile": {"Arn": "arn:aws:iam::111111111111:instance-profile/p"},
         "PrivateIpAddress": "10.0.0.1",
         "PublicIpAddress": "1.2.3.4",
+        "PrivateDnsName": "ip-10-0-0-1.ec2.internal",
+        "PublicDnsName": "ec2-1-2-3-4.compute-1.amazonaws.com",
+        "SourceDestCheck": True,
+        "EbsOptimized": True,
+        "RootDeviceType": "ebs",
+        "RootDeviceName": "/dev/xvda",
+        "MetadataOptions": {
+            "HttpTokens": "required",
+            "HttpEndpoint": "enabled",
+            "HttpPutResponseHopLimit": 2,
+            "InstanceMetadataTags": "enabled",
+        },
         "Monitoring": {"State": "enabled"},
-        "Tags": [{"Key": "Name", "Value": "web"}],
+        "Tags": [{"Key": "Name", "Value": "web"}, {"Key": "env", "Value": "dev"}],
         "SecurityGroups": [{"GroupId": "sg-1", "GroupName": "web-sg"}],
-        "BlockDeviceMappings": [{"DeviceName": "/dev/xvda", "Ebs": {"VolumeId": "vol-1"}}],
+        "BlockDeviceMappings": [
+            {
+                "DeviceName": "/dev/xvda",
+                "Ebs": {"VolumeId": "vol-1", "DeleteOnTermination": True},
+            }
+        ],
         "NetworkInterfaces": [
             {
                 "NetworkInterfaceId": "eni-1",
                 "SubnetId": "subnet-1",
                 "PrivateIpAddress": "10.0.0.1",
+                "MacAddress": "0a:1b:2c:3d:4e:5f",
                 "Association": {"PublicIp": "1.2.3.4"},
+                "Ipv6Addresses": [{"Ipv6Address": "2001:db8::1"}],
             }
         ],
     }
@@ -68,10 +107,9 @@ def _ami(image_id="ami-1"):
         "Architecture": "x86_64",
         "RootDeviceType": "ebs",
         "VirtualizationType": "hvm",
+        "Name": "base",
+        "PlatformDetails": "Linux/UNIX",
         "CreationDate": "2026-01-01T00:00:00.000Z",
-        "BlockDeviceMappings": [
-            {"DeviceName": "/dev/xvda", "Ebs": {"SnapshotId": "snap-1", "VolumeSize": 8}}
-        ],
     }
 
 
@@ -86,24 +124,49 @@ def _stub_full(stub: Stubber, ami9_error: str = "InvalidAMIID.NotFound") -> None
         {"Reservations": [{"Instances": [_minimal_instance()]}]},
         {"NextToken": "n1"},
     )
-    stub.add_response("describe_images", {"Images": [_ami()]}, {"Owners": [ACCOUNT]})
-    for _ in range(2):  # batch call, then per-image fallback
-        stub.add_client_error(
-            "describe_images", ami9_error, expected_params={"ImageIds": ["ami-9"]}
-        )
+    stub.add_client_error(
+        "describe_images", ami9_error, expected_params={"ImageIds": ["ami-1", "ami-9"]}
+    )
+    stub.add_response("describe_images", {"Images": [_ami()]}, {"ImageIds": ["ami-1"]})
+    stub.add_client_error("describe_images", ami9_error, expected_params={"ImageIds": ["ami-9"]})
     stub.add_response(
         "describe_instance_types",
         {
             "InstanceTypes": [
                 {
-                    "InstanceType": "t3.micro",
-                    "VCpuInfo": {"DefaultVCpus": 2},
-                    "MemoryInfo": {"SizeInMiB": 1024},
+                    "InstanceType": "g4dn.xlarge",
+                    "CurrentGeneration": True,
+                    "BareMetal": False,
+                    "BurstablePerformanceSupported": False,
+                    "VCpuInfo": {"DefaultVCpus": 4},
+                    "MemoryInfo": {"SizeInMiB": 16384},
                     "ProcessorInfo": {"SupportedArchitectures": ["x86_64"]},
+                    "GpuInfo": {
+                        "Gpus": [{"Name": "T4", "Manufacturer": "NVIDIA", "Count": 1}],
+                        "TotalGpuMemoryInMiB": 16384,
+                    },
+                    "InstanceStorageInfo": {"TotalSizeInGB": 125},
+                    "NetworkInfo": {"NetworkPerformance": "Up to 25 Gigabit"},
                 }
             ]
         },
-        {"InstanceTypes": ["t3.micro", "t3.small"]},
+        {"InstanceTypes": ["g4dn.xlarge", "t3.small"]},
+    )
+    stub.add_response(
+        "describe_volumes",
+        {
+            "Volumes": [
+                {
+                    "VolumeId": "vol-1",
+                    "Size": 50,
+                    "VolumeType": "gp3",
+                    "Encrypted": True,
+                    "Iops": 3000,
+                    "Throughput": 125,
+                }
+            ]
+        },
+        {"VolumeIds": ["vol-1"]},
     )
     stub.add_response(
         "describe_vpcs",
@@ -115,14 +178,9 @@ def _stub_full(stub: Stubber, ami9_error: str = "InvalidAMIID.NotFound") -> None
         {"Subnets": [{"SubnetId": "subnet-1", "CidrBlock": "10.0.0.0/24"}]},
         {"SubnetIds": ["subnet-1"]},
     )
-    stub.add_response(
-        "describe_security_groups",
-        {"SecurityGroups": [{"GroupId": "sg-1", "GroupName": "web-sg"}]},
-        {"GroupIds": ["sg-1"]},
-    )
 
 
-def test_collects_all_pages_and_maps_optionals():
+def test_collects_all_pages_and_maps_analytics_fields():
     ec2 = _client()
     operations: list[str] = []
     ec2.meta.events.register(
@@ -133,23 +191,40 @@ def test_collects_all_pages_and_maps_optionals():
         data = collect(ec2, ACCOUNT)
         stub.assert_no_pending_responses()
 
-    assert [i.instance_id for i in data.instances] == ["i-1", "i-2"]  # both pages
+    assert [i.instance_id for i in data.instances] == ["i-1", "i-2"]
     full, minimal = data.instances
-    assert full.tags == {"Name": "web"}
+    assert full.name == "web"
+    assert full.tags == {"Name": "web", "env": "dev"}
+    assert full.lifecycle == "spot"
+    assert full.tenancy == "dedicated"
+    assert full.placement_group == "pg-1"
+    assert (full.cpu_core_count, full.cpu_threads_per_core) == (2, 2)
+    assert full.imds_http_tokens == "required"
+    assert full.ipv6_address == "2001:db8::1"
     assert full.public_ip == "1.2.3.4"
-    assert full.network_interfaces[0].public_ip == "1.2.3.4"
+    assert full.network_interfaces[0].mac_address == "0a:1b:2c:3d:4e:5f"
+    assert full.volumes[0].volume_id == "vol-1"
+
+    assert minimal.name is None
+    assert minimal.lifecycle == "on-demand"
+    assert minimal.tenancy == "default"
     assert minimal.vpc_id is None
-    assert minimal.key_name is None
-    assert minimal.iam_profile_arn is None
-    assert minimal.public_ip is None
     assert minimal.tags == {}
-    assert minimal.security_groups == []
-    assert [a.image_id for a in data.amis] == ["ami-1"]  # missing ami-9 tolerated
-    assert data.amis[0].block_mappings[0].snapshot_id == "snap-1"
-    assert data.type_info["t3.micro"].vcpu == 2
+
+    assert list(data.amis) == ["ami-1"]
+    assert data.amis["ami-1"].platform_details == "Linux/UNIX"
+
+    tinfo = data.type_info["g4dn.xlarge"]
+    assert (tinfo.vcpu, tinfo.memory_mib) == (4, 16384)
+    assert (tinfo.gpu_count, tinfo.gpu_model) == (1, "NVIDIA T4")
+    assert tinfo.instance_storage_gib == 125
+    assert tinfo.network_performance == "Up to 25 Gigabit"
+
+    vinfo = data.volume_info["vol-1"]
+    assert (vinfo.size_gib, vinfo.volume_type, vinfo.encrypted) == (50, "gp3", True)
+
     assert data.vpc_cidrs == {"vpc-1": "10.0.0.0/16"}
     assert data.subnet_cidrs == {"subnet-1": "10.0.0.0/24"}
-    assert data.sg_names == {"sg-1": "web-sg"}
     assert operations
     assert all(op.startswith("Describe") for op in operations)
 
@@ -162,7 +237,6 @@ def test_unexpected_ami_error_is_not_swallowed():
             {"Reservations": [{"Instances": [_minimal_instance()]}]},
             {},
         )
-        stub.add_response("describe_images", {"Images": []}, {"Owners": [ACCOUNT]})
         stub.add_client_error("describe_images", "UnauthorizedOperation")
         with pytest.raises(Exception, match="UnauthorizedOperation"):
             collect(ec2, ACCOUNT)

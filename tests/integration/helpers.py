@@ -7,11 +7,12 @@ from botocore.exceptions import ClientError
 
 from ec2_scraping.models import (
     AmiRecord,
-    BlockMapping,
     Collected,
     InstanceRecord,
     NetworkInterfaceRecord,
-    VolumeRecord,
+    TypeInfo,
+    VolumeAttachment,
+    VolumeInfo,
 )
 from ec2_scraping.session import SsoLoginRequired
 
@@ -19,6 +20,7 @@ from ec2_scraping.session import SsoLoginRequired
 def make_instance(instance_id: str = "i-1", **kw) -> InstanceRecord:
     base: dict[str, Any] = {
         "instance_id": instance_id,
+        "name": "web",
         "instance_type": "t3.micro",
         "availability_zone": "us-east-1a",
         "image_id": "ami-1",
@@ -30,10 +32,16 @@ def make_instance(instance_id: str = "i-1", **kw) -> InstanceRecord:
         "key_name": "key",
         "iam_profile_arn": "arn:aws:iam::111111111111:instance-profile/p",
         "private_ip": "10.0.0.1",
+        "root_device_type": "ebs",
+        "root_device_name": "/dev/xvda",
+        "ebs_optimized": True,
+        "imds_http_tokens": "required",
         "tags": {"Name": "web", "env": "dev"},
         "security_groups": [("sg-1", "web"), ("sg-2", "db")],
-        "volumes": [VolumeRecord("/dev/xvda", "vol-1")],
-        "network_interfaces": [NetworkInterfaceRecord("eni-1", "subnet-1", "10.0.0.1", None)],
+        "volumes": [VolumeAttachment("/dev/xvda", "vol-1", True)],
+        "network_interfaces": [
+            NetworkInterfaceRecord("eni-1", "subnet-1", "10.0.0.1", None, "0a:1b:2c:3d:4e:5f")
+        ],
     }
     base.update(kw)
     return InstanceRecord(**base)
@@ -48,8 +56,6 @@ def make_ami(image_id: str = "ami-1", **kw) -> AmiRecord:
         "root_device_type": "ebs",
         "virtualization_type": "hvm",
         "name": "base",
-        "tags": {"team": "a", "tier": "b"},
-        "block_mappings": [BlockMapping("/dev/xvda", "snap-1", 8)],
     }
     base.update(kw)
     return AmiRecord(**base)
@@ -58,10 +64,11 @@ def make_ami(image_id: str = "ami-1", **kw) -> AmiRecord:
 def collected(*instances: InstanceRecord, amis: tuple[AmiRecord, ...] = ()) -> Collected:
     return Collected(
         instances=list(instances),
-        amis=list(amis),
+        amis={a.image_id: a for a in amis},
+        type_info={"t3.micro": TypeInfo(vcpu=2, memory_mib=1024, architecture="x86_64")},
+        volume_info={"vol-1": VolumeInfo("vol-1", 20, "gp3", True, 3000, 125)},
         vpc_cidrs={"vpc-1": "10.0.0.0/16"},
         subnet_cidrs={"subnet-1": "10.0.0.0/24"},
-        sg_names={"sg-1": "web", "sg-2": "db"},
     )
 
 

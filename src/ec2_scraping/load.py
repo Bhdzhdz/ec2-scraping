@@ -1,341 +1,288 @@
-"""Transactional upserts of collected data into the 3NF schema using SQLAlchemy 2.0."""
+"""Transactional upserts of collected instances and enrichments into the single-table schema."""
 
+from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import delete, func, select
-from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from ec2_scraping.db.base import Base
-from ec2_scraping.db.models import (
-    Account,
-    Ami,
-    AmiBlockDeviceMapping,
-    AmiTag,
-    AvailabilityZone,
-    IamInstanceProfile,
-    Instance,
-    InstanceNetworkInterface,
-    InstanceSecurityGroup,
-    InstanceTag,
-    InstanceType,
-    InstanceVolume,
-    KeyPair,
-    Region,
-    SecurityGroup,
-    Subnet,
-    Vpc,
-)
-from ec2_scraping.models import AmiRecord, Collected, Counts, InstanceRecord
-
-
-def _upsert_ref(
-    db: Session,
-    model: type[Base],
-    keys: dict[str, Any],
-    extra: dict[str, Any] | None = None,
-) -> int:
-    """Insert-or-update a reference row on its unique key and return its id."""
-    extra = extra or {}
-    cols = {**keys, **extra}
-    table = model.__table__  # type: ignore[attr-defined]
-    stmt = mysql_insert(model).values(**cols)
-    updates: dict[str, Any] = {"id": func.last_insert_id(table.c.id)}
-    for col_name in extra:
-        updates[col_name] = func.coalesce(stmt.inserted[col_name], table.c[col_name])
-    res: Any = db.execute(stmt.on_duplicate_key_update(**updates))
-    return int(res.lastrowid)
-
-
-def upsert_account(db: Session, aws_account_id: str) -> int:
-    return _upsert_ref(db, Account, {"aws_account_id": aws_account_id})
-
-
-def upsert_region(db: Session, code: str) -> int:
-    return _upsert_ref(db, Region, {"code": code})
-
-
-def upsert_availability_zone(db: Session, region_id: int, name: str) -> int:
-    return _upsert_ref(db, AvailabilityZone, {"region_id": region_id, "name": name})
-
-
-def upsert_instance_type(
-    db: Session,
-    name: str,
-    vcpu: int | None = None,
-    memory_mib: int | None = None,
-    architecture: str | None = None,
-) -> int:
-    return _upsert_ref(
-        db,
-        InstanceType,
-        {"name": name},
-        {"vcpu": vcpu, "memory_mib": memory_mib, "architecture": architecture},
-    )
-
-
-def upsert_key_pair(db: Session, account_id: int, region_id: int, name: str) -> int:
-    return _upsert_ref(
-        db, KeyPair, {"account_id": account_id, "region_id": region_id, "name": name}
-    )
-
-
-def upsert_iam_instance_profile(db: Session, account_id: int, region_id: int, arn: str) -> int:
-    return _upsert_ref(
-        db, IamInstanceProfile, {"account_id": account_id, "region_id": region_id, "arn": arn}
-    )
-
-
-def upsert_vpc(
-    db: Session, account_id: int, region_id: int, vpc_id: str, cidr: str | None = None
-) -> int:
-    return _upsert_ref(
-        db,
-        Vpc,
-        {"account_id": account_id, "region_id": region_id, "vpc_id": vpc_id},
-        {"cidr": cidr},
-    )
-
-
-def upsert_subnet(
-    db: Session, vpc_pk: int, availability_zone_id: int, subnet_id: str, cidr: str | None = None
-) -> int:
-    return _upsert_ref(
-        db,
-        Subnet,
-        {"vpc_pk": vpc_pk, "subnet_id": subnet_id},
-        {"availability_zone_id": availability_zone_id, "cidr": cidr},
-    )
-
-
-def upsert_security_group(db: Session, vpc_pk: int, group_id: str, name: str | None = None) -> int:
-    return _upsert_ref(db, SecurityGroup, {"vpc_pk": vpc_pk, "group_id": group_id}, {"name": name})
-
-
-class LoadContext:
-    """One account/region load: memoises reference lookups for the whole combination."""
-
-    def __init__(self, db: Session, run_id: int, account_pk: int, region_pk: int):
-        self.db = db
-        self.run_id = run_id
-        self.account_pk = account_pk
-        self.region_pk = region_pk
-        self._cache: dict[tuple, int] = {}
-
-    def _memo(self, key: tuple, make) -> int:
-        if key not in self._cache:
-            self._cache[key] = make()
-        return self._cache[key]
-
-    def az(self, name: str) -> int:
-        return self._memo(
-            ("az", name), lambda: upsert_availability_zone(self.db, self.region_pk, name)
-        )
-
-    def instance_type(self, name: str, info) -> int:
-        return self._memo(
-            ("type", name),
-            lambda: upsert_instance_type(
-                self.db,
-                name,
-                *((info.vcpu, info.memory_mib, info.architecture) if info else (None, None, None)),
-            ),
-        )
-
-    def key_pair(self, name: str) -> int:
-        return self._memo(
-            ("key", name), lambda: upsert_key_pair(self.db, self.account_pk, self.region_pk, name)
-        )
-
-    def iam_profile(self, arn: str) -> int:
-        return self._memo(
-            ("iam", arn),
-            lambda: upsert_iam_instance_profile(self.db, self.account_pk, self.region_pk, arn),
-        )
-
-    def vpc(self, vpc_id: str, cidr: str | None) -> int:
-        return self._memo(
-            ("vpc", vpc_id),
-            lambda: upsert_vpc(self.db, self.account_pk, self.region_pk, vpc_id, cidr),
-        )
-
-    def subnet(self, vpc_pk: int, az_pk: int, subnet_id: str, cidr: str | None) -> int:
-        return self._memo(
-            ("subnet", vpc_pk, subnet_id),
-            lambda: upsert_subnet(self.db, vpc_pk, az_pk, subnet_id, cidr),
-        )
-
-    def security_group(self, vpc_pk: int, group_id: str, name: str | None) -> int:
-        return self._memo(
-            ("sg", vpc_pk, group_id),
-            lambda: upsert_security_group(self.db, vpc_pk, group_id, name),
-        )
-
-
-Child = tuple[type[Base], str, tuple[str, ...], set[tuple]]
-
-
-def _sync(
-    ctx: LoadContext,
-    model: type[Instance | Ami],
-    key: dict[str, Any],
-    cols: dict[str, Any],
-    children: list[Child],
-) -> str:
-    """Upsert one resource and its child rows; return created/updated/unchanged."""
-    db = ctx.db
-    existing = db.scalars(select(model).filter_by(**key)).first()
-
-    if existing is None:
-        obj = model(**key, **cols, last_scrape_run_id=ctx.run_id)
-        db.add(obj)
-        db.flush()
-        _replace_children(db, obj.id, children)
-        return "created"
-
-    pk = existing.id
-    changed = any(getattr(existing, c) != v for c, v in cols.items())
-    if not changed:
-        for child_model, fk, names, rows in children:
-            child_cols = [getattr(child_model, n) for n in names]
-            fk_col = getattr(child_model, fk)
-            stored = {tuple(r) for r in db.execute(select(*child_cols).where(fk_col == pk)).all()}
-            if stored != rows:
-                changed = True
-                break
-
-    existing.last_seen_at = func.now()  # type: ignore[assignment]
-    existing.last_scrape_run_id = ctx.run_id
-    if changed:
-        for c, v in cols.items():
-            setattr(existing, c, v)
-    db.flush()
-    if changed:
-        _replace_children(db, pk, children)
-        return "updated"
-    return "unchanged"
-
-
-def _replace_children(db: Session, pk: int, children: list[Child]) -> None:
-    for child_model, fk, names, rows in children:
-        fk_col = getattr(child_model, fk)
-        db.execute(delete(child_model).where(fk_col == pk))
-        if rows:
-            for r in sorted(rows, key=repr):
-                db.add(child_model(**{fk: pk, **dict(zip(names, r, strict=True))}))
-    db.flush()
+from ec2_scraping.db.models import Instance
+from ec2_scraping.models import Collected, Counts, EnrichmentResult, InstanceRecord
 
 
 def _clip(value: str | None, size: int) -> str | None:
     return value[:size] if value is not None else None
 
 
-def load_instances(ctx: LoadContext, data: Collected) -> Counts:
+def _profile_name(arn: str | None) -> str | None:
+    if not arn:
+        return None
+    return _clip(arn.rsplit("/", 1)[-1], 128)
+
+
+def _instance_family(instance_type: str) -> str | None:
+    return _clip(instance_type.split(".", 1)[0], 32) if "." in instance_type else None
+
+
+def get_accessed_ssh_instance_ids(
+    db: Session, aws_account_id: str, region: str, instance_ids: list[str]
+) -> set[str]:
+    """Return instance_ids in (account, region) that already have ssh_status == 'succeeded'."""
+    if not instance_ids:
+        return set()
+    stmt = select(Instance.instance_id).where(
+        Instance.aws_account_id == aws_account_id,
+        Instance.region == region,
+        Instance.instance_id.in_(instance_ids),
+        Instance.ssh_status == "succeeded",
+    )
+    return set(db.scalars(stmt).all())
+
+
+def load_instances(
+    db: Session,
+    aws_account_id: str,
+    region: str,
+    data: Collected,
+    enrichments: dict[str, dict[str, EnrichmentResult]] | None = None,
+) -> Counts:
+    """Upsert all collected instances for an (account, region) into the `instance` table."""
     counts = Counts()
     for inst in data.instances:
-        counts.add(_load_instance(ctx, inst, data))
+        inst_enrichments = (enrichments or {}).get(inst.instance_id)
+        counts.add(_load_instance(db, aws_account_id, region, inst, data, inst_enrichments))
     return counts
 
 
-def _load_instance(ctx: LoadContext, inst: InstanceRecord, data: Collected) -> str:
-    az_pk = ctx.az(inst.availability_zone)
-    vpc_pk = ctx.vpc(inst.vpc_id, data.vpc_cidrs.get(inst.vpc_id)) if inst.vpc_id else None
+def _build_volume_payload(
+    inst: InstanceRecord, data: Collected
+) -> tuple[
+    list[dict[str, Any]],
+    str | None,
+    int | None,
+    str | None,
+    bool | None,
+    int,
+    int,
+    bool | None,
+]:
+    vol_list: list[dict[str, Any]] = []
+    root_vol_id: str | None = None
+    root_size: int | None = None
+    root_type: str | None = None
+    root_encrypted: bool | None = None
+    total_size = 0
+    encrypted_flags: list[bool] = []
 
-    def subnet_pk(subnet_id: str | None) -> int | None:
-        if not subnet_id or vpc_pk is None:
-            return None
-        return ctx.subnet(vpc_pk, az_pk, subnet_id, data.subnet_cidrs.get(subnet_id))
+    for att in sorted(inst.volumes, key=lambda v: v.device_name):
+        vinfo = data.volume_info.get(att.volume_id)
+        size_gib = vinfo.size_gib if vinfo else None
+        vtype = vinfo.volume_type if vinfo else None
+        enc = vinfo.encrypted if vinfo else None
+        if size_gib is not None:
+            total_size += size_gib
+        if enc is not None:
+            encrypted_flags.append(bool(enc))
+        if inst.root_device_name and att.device_name == inst.root_device_name:
+            root_vol_id = att.volume_id
+            root_size = size_gib
+            root_type = vtype
+            root_encrypted = bool(enc) if enc is not None else None
+        vol_list.append(
+            {
+                "device_name": att.device_name,
+                "volume_id": att.volume_id,
+                "size_gib": size_gib,
+                "volume_type": vtype,
+                "encrypted": enc,
+                "iops": vinfo.iops if vinfo else None,
+                "throughput": vinfo.throughput if vinfo else None,
+                "delete_on_termination": att.delete_on_termination,
+            }
+        )
 
-    sg_pks = set()
-    if vpc_pk is not None:
-        for group_id, name in inst.security_groups:
-            sg_pks.add((ctx.security_group(vpc_pk, group_id, data.sg_names.get(group_id) or name),))
+    all_encrypted = all(encrypted_flags) if encrypted_flags else None
+    return (
+        vol_list,
+        root_vol_id,
+        root_size,
+        root_type,
+        root_encrypted,
+        len(vol_list),
+        total_size,
+        all_encrypted,
+    )
 
-    cols = {
-        "instance_type_id": ctx.instance_type(
-            inst.instance_type, data.type_info.get(inst.instance_type)
-        ),
-        "availability_zone_id": az_pk,
-        "subnet_pk": subnet_pk(inst.subnet_id),
-        "key_pair_id": ctx.key_pair(inst.key_name) if inst.key_name else None,
-        "iam_instance_profile_id": ctx.iam_profile(inst.iam_profile_arn)
-        if inst.iam_profile_arn
-        else None,
-        "image_id": inst.image_id,
+
+def _load_instance(
+    db: Session,
+    aws_account_id: str,
+    region: str,
+    inst: InstanceRecord,
+    data: Collected,
+    inst_enrichments: dict[str, EnrichmentResult] | None = None,
+) -> str:
+    tinfo = data.type_info.get(inst.instance_type)
+    ami = data.amis.get(inst.image_id)
+    (
+        vol_list,
+        root_vol_id,
+        root_size,
+        root_type,
+        root_encrypted,
+        vol_count,
+        total_vol_size,
+        all_encrypted,
+    ) = _build_volume_payload(inst, data)
+
+    sg_list = [
+        {"group_id": gid, "group_name": gname}
+        for gid, gname in sorted(inst.security_groups, key=lambda g: g[0])
+    ]
+    nic_list = [
+        {
+            "eni_id": n.eni_id,
+            "subnet_id": n.subnet_id,
+            "private_ip": n.private_ip,
+            "public_ip": n.public_ip,
+            "mac_address": n.mac_address,
+            "ipv6_addresses": n.ipv6_addresses,
+        }
+        for n in sorted(inst.network_interfaces, key=lambda n: n.eni_id)
+    ]
+
+    cols: dict[str, Any] = {
+        "name": _clip(inst.name, 256),
         "state": inst.state,
-        "architecture": inst.architecture,
-        "platform": inst.platform,
+        "state_reason_code": _clip(inst.state_reason_code, 64),
+        "state_transition_reason": _clip(inst.state_transition_reason, 255),
+        "lifecycle": _clip(inst.lifecycle, 32) or "on-demand",
+        "spot_instance_request_id": _clip(inst.spot_instance_request_id, 32),
+        "capacity_reservation_id": _clip(inst.capacity_reservation_id, 32),
+        "tenancy": _clip(inst.tenancy, 32) or "default",
+        "placement_group": _clip(inst.placement_group, 255),
+        "host_id": _clip(inst.host_id, 32),
         "launch_time": inst.launch_time,
+        "usage_operation": _clip(inst.usage_operation, 64),
+        "monitoring": inst.monitoring,
+        "instance_type": inst.instance_type,
+        "instance_family": _instance_family(inst.instance_type),
+        "architecture": inst.architecture,
+        "vcpu": tinfo.vcpu if tinfo else None,
+        "cpu_core_count": inst.cpu_core_count,
+        "cpu_threads_per_core": inst.cpu_threads_per_core,
+        "memory_mib": tinfo.memory_mib if tinfo else None,
+        "gpu_count": tinfo.gpu_count if tinfo else None,
+        "gpu_model": _clip(tinfo.gpu_model, 64) if tinfo else None,
+        "gpu_memory_mib": tinfo.gpu_memory_mib if tinfo else None,
+        "instance_storage_gib": tinfo.instance_storage_gib if tinfo else None,
+        "network_performance": _clip(tinfo.network_performance, 64) if tinfo else None,
+        "is_current_generation": tinfo.is_current_generation if tinfo else None,
+        "is_burstable": tinfo.is_burstable if tinfo else None,
+        "is_bare_metal": tinfo.is_bare_metal if tinfo else None,
+        "hypervisor": _clip(inst.hypervisor, 16),
+        "virtualization_type": _clip(inst.virtualization_type, 16),
+        "ena_support": inst.ena_support,
+        "sriov_net_support": _clip(inst.sriov_net_support, 16),
+        "boot_mode": _clip(inst.boot_mode, 32),
+        "tpm_support": _clip(inst.tpm_support, 32),
+        "platform": _clip(inst.platform, 32),
+        "platform_details": _clip(inst.platform_details, 64),
+        "image_id": inst.image_id,
+        "ami_owner_aws_account_id": ami.owner_aws_account_id if ami else None,
+        "ami_name": _clip(ami.name, 255) if ami else None,
+        "ami_description": _clip(ami.description, 1024) if ami else None,
+        "ami_creation_date": ami.creation_date if ami else None,
+        "ami_state": ami.state if ami else None,
+        "ami_architecture": ami.architecture if ami else None,
+        "ami_platform": ami.platform if ami else None,
+        "ami_platform_details": _clip(ami.platform_details, 64) if ami else None,
+        "ami_root_device_type": ami.root_device_type if ami else None,
+        "ami_virtualization_type": ami.virtualization_type if ami else None,
+        "ami_is_public": bool(ami.is_public) if ami else None,
+        "ami_deprecation_time": ami.deprecation_time if ami else None,
+        "availability_zone": inst.availability_zone,
+        "vpc_id": inst.vpc_id,
+        "vpc_cidr": data.vpc_cidrs.get(inst.vpc_id) if inst.vpc_id else None,
+        "subnet_id": inst.subnet_id,
+        "subnet_cidr": data.subnet_cidrs.get(inst.subnet_id) if inst.subnet_id else None,
         "private_ip": inst.private_ip,
         "public_ip": inst.public_ip,
-        "monitoring": inst.monitoring,
+        "ipv6_address": inst.ipv6_address,
+        "private_dns_name": _clip(inst.private_dns_name, 255),
+        "public_dns_name": _clip(inst.public_dns_name, 255),
+        "source_dest_check": inst.source_dest_check,
+        "eni_count": len(nic_list),
+        "security_group_count": len(sg_list),
+        "ebs_optimized": bool(inst.ebs_optimized),
+        "root_device_type": _clip(inst.root_device_type, 16),
+        "root_device_name": _clip(inst.root_device_name, 64),
+        "root_volume_id": root_vol_id,
+        "root_volume_size_gib": root_size,
+        "root_volume_type": root_type,
+        "root_volume_encrypted": root_encrypted,
+        "ebs_volume_count": vol_count,
+        "ebs_total_size_gib": total_vol_size,
+        "ebs_all_encrypted": all_encrypted,
+        "key_name": _clip(inst.key_name, 255),
+        "iam_instance_profile_arn": _clip(inst.iam_profile_arn, 255),
+        "iam_instance_profile_name": _profile_name(inst.iam_profile_arn),
+        "imds_http_tokens": _clip(inst.imds_http_tokens, 16),
+        "imds_http_endpoint": _clip(inst.imds_http_endpoint, 16),
+        "imds_hop_limit": inst.imds_hop_limit,
+        "imds_instance_metadata_tags": _clip(inst.imds_instance_metadata_tags, 16),
+        "tags": dict(sorted(inst.tags.items())),
+        "security_groups": sg_list,
+        "volumes": vol_list,
+        "network_interfaces": nic_list,
     }
-    children: list[Child] = [
-        (
-            InstanceTag,
-            "instance_pk",
-            ("tag_key", "tag_value"),
-            {(_clip(k, 128), _clip(v, 256)) for k, v in inst.tags.items()},
-        ),
-        (InstanceSecurityGroup, "instance_pk", ("security_group_pk",), sg_pks),
-        (
-            InstanceVolume,
-            "instance_pk",
-            ("device_name", "volume_id", "size_gib", "volume_type"),
-            {(v.device_name, v.volume_id, None, None) for v in inst.volumes},
-        ),
-        (
-            InstanceNetworkInterface,
-            "instance_pk",
-            ("eni_id", "subnet_pk", "private_ip", "public_ip"),
-            {
-                (n.eni_id, subnet_pk(n.subnet_id), n.private_ip, n.public_ip)
-                for n in inst.network_interfaces
-            },
-        ),
-    ]
+
+    if inst_enrichments:
+        now = datetime.now(UTC).replace(tzinfo=None, microsecond=0)
+        if "ssh" in inst_enrichments:
+            ssh_res = inst_enrichments["ssh"]
+            sf = ssh_res.facts or {}
+            cols["ssh_status"] = _clip(ssh_res.status, 32)
+            cols["ssh_user"] = _clip(sf.get("ssh_user"), 64)
+            cols["ssh_host"] = _clip(sf.get("ssh_host"), 45)
+            cols["ssh_port"] = sf.get("ssh_port")
+            cols["ssh_os_id"] = _clip(sf.get("os_id"), 64)
+            cols["ssh_os_version"] = _clip(sf.get("os_version"), 64)
+            cols["ssh_os_pretty_name"] = _clip(sf.get("os_pretty_name"), 255)
+            cols["ssh_kernel"] = _clip(sf.get("kernel"), 128)
+            cols["ssh_hostname"] = _clip(sf.get("hostname"), 255)
+            cols["ssh_uptime_seconds"] = sf.get("uptime_seconds")
+            cols["ssh_package_count"] = sf.get("package_count")
+            cols["ssh_listening_port_count"] = sf.get("listening_port_count")
+            cols["ssh_container_count"] = sf.get("container_count")
+            cols["ssh_reboot_required"] = sf.get("reboot_required")
+            cols["ssh_facts"] = ssh_res.facts
+            cols["ssh_error"] = ssh_res.error
+            cols["ssh_collected_at"] = now
+        other = {
+            k: {"status": v.status, "facts": v.facts, "error": v.error}
+            for k, v in inst_enrichments.items()
+            if k != "ssh"
+        }
+        if other:
+            cols["extra_facts"] = other
+
     key = {
-        "account_id": ctx.account_pk,
-        "region_id": ctx.region_pk,
+        "aws_account_id": aws_account_id,
+        "region": region,
         "instance_id": inst.instance_id,
     }
-    return _sync(ctx, Instance, key, cols, children)
 
+    existing = db.scalars(select(Instance).filter_by(**key)).first()
+    if existing is None:
+        db.add(Instance(**key, **cols))
+        db.flush()
+        return "created"
 
-def load_amis(ctx: LoadContext, data: Collected) -> Counts:
-    counts = Counts()
-    for ami in data.amis:
-        counts.add(_load_ami(ctx, ami))
-    return counts
-
-
-def _load_ami(ctx: LoadContext, ami: AmiRecord) -> str:
-    cols = {
-        "owner_aws_account_id": ami.owner_aws_account_id,
-        "name": _clip(ami.name, 255),
-        "description": _clip(ami.description, 1024),
-        "creation_date": ami.creation_date,
-        "state": ami.state,
-        "architecture": ami.architecture,
-        "platform": ami.platform,
-        "root_device_type": ami.root_device_type,
-        "virtualization_type": ami.virtualization_type,
-        "is_public": bool(ami.is_public),
-        "deprecation_time": ami.deprecation_time,
-    }
-    children: list[Child] = [
-        (
-            AmiTag,
-            "ami_pk",
-            ("tag_key", "tag_value"),
-            {(_clip(k, 128), _clip(v, 256)) for k, v in ami.tags.items()},
-        ),
-        (
-            AmiBlockDeviceMapping,
-            "ami_pk",
-            ("device_name", "snapshot_id", "size_gib"),
-            {(b.device_name, b.snapshot_id, b.size_gib) for b in ami.block_mappings},
-        ),
-    ]
-    key = {"account_id": ctx.account_pk, "region_id": ctx.region_pk, "image_id": ami.image_id}
-    return _sync(ctx, Ami, key, cols, children)
+    changed = any(getattr(existing, c) != v for c, v in cols.items())
+    existing.last_seen_at = func.now()  # type: ignore[assignment]
+    if changed:
+        for c, v in cols.items():
+            setattr(existing, c, v)
+    db.flush()
+    return "updated" if changed else "unchanged"
