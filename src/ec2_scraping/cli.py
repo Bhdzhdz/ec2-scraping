@@ -2,8 +2,9 @@
 
 import argparse
 import sys
+from pathlib import Path
 
-from ec2_scraping import db, runner, session, ssh
+from ec2_scraping import db, report, runner, session, ssh
 from ec2_scraping.models import InstanceEnricher, RunResult
 
 EXIT_OK, EXIT_PARTIAL, EXIT_FAILED, EXIT_USAGE = 0, 1, 2, 64
@@ -14,6 +15,16 @@ class _Parser(argparse.ArgumentParser):
     def error(self, message):  # usage errors use exit code 64 per the contract
         self.print_usage(sys.stderr)
         self.exit(EXIT_USAGE, f"{self.prog}: error: {message}\n")
+
+
+def _add_filter_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--dsn",
+        help=f"database DSN (default env {db.DSN_ENV}, falling back to {db.DEFAULT_SQLITE_DSN})",
+    )
+    p.add_argument("--region", action="append", help="filter by region (repeatable)")
+    p.add_argument("--account", action="append", help="filter by AWS account ID (repeatable)")
+    p.add_argument("--state", action="append", help="filter by instance state (repeatable)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -71,6 +82,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--ssh-only-unaccessed",
         action="store_true",
         help="only probe instances not yet accessed via SSH and keep previous SSH data",
+    )
+
+    summary_p = sub.add_parser("summary", help="print a summary of the stored EC2 inventory")
+    _add_filter_args(summary_p)
+
+    export_p = sub.add_parser("export", help="export the stored EC2 inventory to CSV")
+    _add_filter_args(export_p)
+    export_p.add_argument(
+        "-o",
+        "--output",
+        help="output CSV file path (defaults to stdout; '-' writes to stdout)",
     )
     return parser
 
@@ -131,9 +153,55 @@ def _cmd_run(args, open_session=session.open_session) -> int:
     return _EXIT[result.status]
 
 
+def _cmd_summary(args) -> int:
+    conn = db.connect(args.dsn)
+    try:
+        summary = report.summarize_instances(
+            conn,
+            regions=args.region,
+            accounts=args.account,
+            states=args.state,
+        )
+    finally:
+        conn.close()
+    print(report.format_inventory_summary(summary))
+    return EXIT_OK
+
+
+def _cmd_export(args) -> int:
+    conn = db.connect(args.dsn)
+    try:
+        if args.output and args.output != "-":
+            path = Path(args.output)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8", newline="") as fh:
+                report.export_instances_csv(
+                    conn,
+                    fh,
+                    regions=args.region,
+                    accounts=args.account,
+                    states=args.state,
+                )
+        else:
+            report.export_instances_csv(
+                conn,
+                sys.stdout,
+                regions=args.region,
+                accounts=args.account,
+                states=args.state,
+            )
+    finally:
+        conn.close()
+    return EXIT_OK
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "summary":
+            return _cmd_summary(args)
+        if args.command == "export":
+            return _cmd_export(args)
         return _cmd_run(args)
     except (db.ConfigError, session.SsoLoginRequired) as exc:
         print(f"ec2-scrape: error: {exc}", file=sys.stderr)
