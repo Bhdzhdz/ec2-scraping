@@ -427,3 +427,31 @@ def test_ssh_live_ami_learning_and_cached_keys(tmp_path):
     assert seen_kwargs[0]["login_timeout"] == 3.5
     assert collector._load_key_cached(str(pem)) == str(pem)
     assert collector._load_key_cached(str(pem)) == str(pem)
+
+
+def test_cli_daemon_env_and_max_cycles(monkeypatch):
+    monkeypatch.setenv("EC2_SCRAPE_PROFILES", "prof-a,prof-b")
+    monkeypatch.setenv("EC2_SCRAPE_REGIONS", "us-east-1")
+    monkeypatch.setenv("EC2_SCRAPE_SSH", "true")
+    monkeypatch.setenv("EC2_SCRAPE_INTERVAL", "0.01")
+
+    monkeypatch.setattr(cli.db, "connect", lambda dsn: MagicMock())
+    calls: list[tuple[list[str], list[str] | None]] = []
+
+    def fake_run(conn, profiles, regions, all_regions, **kw):
+        calls.append((profiles, regions))
+        return runner.RunResult(status="succeeded", combos=[])
+
+    monkeypatch.setattr(cli.runner, "run", fake_run)
+    rc = cli.main(["daemon", "--max-cycles", "2"])
+    assert rc == 0
+    assert calls == [(["prof-a", "prof-b"], ["us-east-1"]), (["prof-a", "prof-b"], ["us-east-1"])]
+
+    # Missing profile error when env var not set
+    monkeypatch.delenv("EC2_SCRAPE_PROFILES", raising=False)
+    assert cli.main(["daemon", "--max-cycles", "1"]) == cli.EXIT_USAGE
+    assert cli.main(["daemon", "--profile", "p", "--interval", "0"]) == cli.EXIT_USAGE
+    assert (
+        cli.main(["daemon", "--profile", "p", "--region", "us-east-1", "--all-regions"])
+        == cli.EXIT_USAGE
+    )

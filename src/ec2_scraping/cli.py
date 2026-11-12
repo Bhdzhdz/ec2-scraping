@@ -1,7 +1,11 @@
 """`ec2-scrape` command line interface."""
 
 import argparse
+import os
+import signal
 import sys
+import threading
+from datetime import UTC, datetime
 from pathlib import Path
 
 from ec2_scraping import db, report, runner, session, ssh
@@ -9,6 +13,30 @@ from ec2_scraping.models import InstanceEnricher, RunResult
 
 EXIT_OK, EXIT_PARTIAL, EXIT_FAILED, EXIT_USAGE = 0, 1, 2, 64
 _EXIT = {"succeeded": EXIT_OK, "partial": EXIT_PARTIAL, "failed": EXIT_FAILED}
+
+
+def _env_list(name: str) -> list[str] | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    return int(raw) if raw else default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    return float(raw) if raw else default
 
 
 class _Parser(argparse.ArgumentParser):
@@ -27,61 +55,108 @@ def _add_filter_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--state", action="append", help="filter by instance state (repeatable)")
 
 
+def _add_scrape_args(p: argparse.ArgumentParser, *, profile_required: bool = True) -> None:
+    env_profiles = None if profile_required else _env_list("EC2_SCRAPE_PROFILES")
+    p.add_argument(
+        "--profile",
+        action="append",
+        required=profile_required and not env_profiles,
+        default=env_profiles,
+        help="AWS SSO profile (repeatable; or env EC2_SCRAPE_PROFILES=p1,p2 in daemon mode)",
+    )
+    p.add_argument(
+        "--region",
+        action="append",
+        default=None if profile_required else _env_list("EC2_SCRAPE_REGIONS"),
+        help="region (repeatable; or env EC2_SCRAPE_REGIONS=r1,r2 in daemon mode)",
+    )
+    p.add_argument(
+        "--all-regions",
+        action="store_true",
+        default=False if profile_required else _env_bool("EC2_SCRAPE_ALL_REGIONS"),
+        help="all enabled regions (or env EC2_SCRAPE_ALL_REGIONS=1 in daemon mode)",
+    )
+    p.add_argument(
+        "--dsn",
+        help=f"database DSN (default env {db.DSN_ENV}, falling back to {db.DEFAULT_SQLITE_DSN})",
+    )
+    p.add_argument(
+        "--ssh",
+        action="store_true",
+        default=False if profile_required else _env_bool("EC2_SCRAPE_SSH"),
+        help="probe running instances over SSH using common usernames to collect OS/system facts",
+    )
+    p.add_argument(
+        "--ssh-user",
+        action="append",
+        dest="ssh_users",
+        default=None if profile_required else _env_list("EC2_SCRAPE_SSH_USERS"),
+        help="candidate SSH username (repeatable; defaults to common Linux distro usernames)",
+    )
+    p.add_argument(
+        "--ssh-key",
+        action="append",
+        dest="ssh_keys",
+        default=None if profile_required else _env_list("EC2_SCRAPE_SSH_KEYS"),
+        help="private key file path to offer during SSH auth (repeatable)",
+    )
+    p.add_argument(
+        "--ssh-key-dir",
+        default=None if profile_required else os.environ.get("EC2_SCRAPE_SSH_KEY_DIR"),
+        help="directory of private keys (matches <key_name> or <key_name>.pem first)",
+    )
+    p.add_argument(
+        "--ssh-port",
+        type=int,
+        default=22 if profile_required else _env_int("EC2_SCRAPE_SSH_PORT", 22),
+        help="SSH port (default: 22)",
+    )
+    p.add_argument(
+        "--ssh-timeout",
+        type=float,
+        default=5.0 if profile_required else _env_float("EC2_SCRAPE_SSH_TIMEOUT", 5.0),
+        help="SSH connection timeout in seconds (default: 5.0)",
+    )
+    p.add_argument(
+        "--ssh-concurrency",
+        type=int,
+        default=32 if profile_required else _env_int("EC2_SCRAPE_SSH_CONCURRENCY", 32),
+        help="maximum concurrent SSH instance probes (default: 32)",
+    )
+    p.add_argument(
+        "--ssh-prefer-public-ip",
+        action="store_true",
+        default=False if profile_required else _env_bool("EC2_SCRAPE_SSH_PREFER_PUBLIC_IP"),
+        help="connect to public_ip before private_ip when probing over SSH",
+    )
+    p.add_argument(
+        "--ssh-only-unaccessed",
+        action="store_true",
+        default=False if profile_required else _env_bool("EC2_SCRAPE_SSH_ONLY_UNACCESSED"),
+        help="only probe instances not yet accessed via SSH and keep previous SSH data",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(prog="ec2-scrape", description="Inventory EC2 instances.")
     sub = parser.add_subparsers(dest="command", required=True, parser_class=_Parser)
 
     run_p = sub.add_parser("run", help="scrape profiles/regions into the database")
-    run_p.add_argument("--profile", action="append", required=True, help="AWS SSO profile")
-    run_p.add_argument("--region", action="append", help="region (repeatable)")
-    run_p.add_argument("--all-regions", action="store_true", help="all enabled regions")
-    run_p.add_argument(
-        "--dsn",
-        help=f"database DSN (default env {db.DSN_ENV}, falling back to {db.DEFAULT_SQLITE_DSN})",
-    )
-    run_p.add_argument(
-        "--ssh",
-        action="store_true",
-        help="probe running instances over SSH using common usernames to collect OS/system facts",
-    )
-    run_p.add_argument(
-        "--ssh-user",
-        action="append",
-        dest="ssh_users",
-        help="candidate SSH username (repeatable; defaults to common Linux distro usernames)",
-    )
-    run_p.add_argument(
-        "--ssh-key",
-        action="append",
-        dest="ssh_keys",
-        help="private key file path to offer during SSH auth (repeatable)",
-    )
-    run_p.add_argument(
-        "--ssh-key-dir",
-        help="directory of private keys (matches <key_name> or <key_name>.pem first)",
-    )
-    run_p.add_argument("--ssh-port", type=int, default=22, help="SSH port (default: 22)")
-    run_p.add_argument(
-        "--ssh-timeout",
+    _add_scrape_args(run_p, profile_required=True)
+
+    daemon_p = sub.add_parser("daemon", help="run continuous periodic scrape cycles as a daemon")
+    _add_scrape_args(daemon_p, profile_required=False)
+    daemon_p.add_argument(
+        "--interval",
         type=float,
-        default=5.0,
-        help="SSH connection timeout in seconds (default: 5.0)",
+        default=_env_float("EC2_SCRAPE_INTERVAL", 3600.0),
+        help="seconds between scrape cycles (default: 3600 or env EC2_SCRAPE_INTERVAL)",
     )
-    run_p.add_argument(
-        "--ssh-concurrency",
+    daemon_p.add_argument(
+        "--max-cycles",
         type=int,
-        default=32,
-        help="maximum concurrent SSH instance probes (default: 32)",
-    )
-    run_p.add_argument(
-        "--ssh-prefer-public-ip",
-        action="store_true",
-        help="connect to public_ip before private_ip when probing over SSH",
-    )
-    run_p.add_argument(
-        "--ssh-only-unaccessed",
-        action="store_true",
-        help="only probe instances not yet accessed via SSH and keep previous SSH data",
+        default=None,
+        help="stop after N cycles (default: run indefinitely until SIGINT/SIGTERM)",
     )
 
     summary_p = sub.add_parser("summary", help="print a summary of the stored EC2 inventory")
@@ -153,6 +228,64 @@ def _cmd_run(args, open_session=session.open_session) -> int:
     return _EXIT[result.status]
 
 
+def _cmd_daemon(
+    args,
+    open_session=session.open_session,
+    stop_event: threading.Event | None = None,
+) -> int:
+    if not args.profile:
+        print(
+            "ec2-scrape: error: daemon requires --profile or EC2_SCRAPE_PROFILES",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+    if args.all_regions and args.region:
+        print("ec2-scrape: error: --all-regions cannot be combined with --region", file=sys.stderr)
+        return EXIT_USAGE
+    if args.interval <= 0:
+        print("ec2-scrape: error: --interval must be > 0", file=sys.stderr)
+        return EXIT_USAGE
+
+    stop = stop_event if stop_event is not None else threading.Event()
+    if stop_event is None and threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, lambda _s, _f: stop.set())
+
+    enrichers = _build_enrichers(args)
+    cycle = 0
+    last_code = EXIT_OK
+    while not stop.is_set():
+        cycle += 1
+        ts = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        print(f"[{ts}] Starting scrape cycle #{cycle}...", flush=True)
+        try:
+            conn = db.connect(args.dsn)
+            try:
+                result = runner.run(
+                    conn,
+                    args.profile,
+                    args.region,
+                    args.all_regions,
+                    open_session=open_session,
+                    enrichers=enrichers,
+                )
+            finally:
+                conn.close()
+            print(format_summary(result), flush=True)
+            last_code = _EXIT[result.status]
+        except Exception as exc:
+            print(f"[{ts}] Scrape cycle #{cycle} error: {exc}", file=sys.stderr, flush=True)
+            last_code = EXIT_FAILED
+
+        if args.max_cycles is not None and cycle >= args.max_cycles:
+            break
+        if stop.wait(args.interval):
+            break
+
+    print("Daemon stopped.", flush=True)
+    return last_code
+
+
 def _cmd_summary(args) -> int:
     conn = db.connect(args.dsn)
     try:
@@ -202,6 +335,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_summary(args)
         if args.command == "export":
             return _cmd_export(args)
+        if args.command == "daemon":
+            return _cmd_daemon(args)
         return _cmd_run(args)
     except (db.ConfigError, session.SsoLoginRequired) as exc:
         print(f"ec2-scrape: error: {exc}", file=sys.stderr)

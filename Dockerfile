@@ -2,9 +2,13 @@ FROM python:3.12-slim
 
 COPY --from=ghcr.io/astral-sh/uv:0.13.1 /uv /uvx /bin/
 
-ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy PYTHONUNBUFFERED=1
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    PYTHONUNBUFFERED=1 \
+    EC2_SCRAPE_DSN="sqlite:////data/ec2_inventory.db"
 
-RUN useradd --create-home --uid 1000 app
+RUN useradd --create-home --uid 1000 app && \
+    mkdir -p /data && chown app:app /data
 
 WORKDIR /app
 
@@ -20,6 +24,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 ENV PATH="/app/.venv/bin:$PATH"
 
+VOLUME ["/data"]
+
 USER app
 
-CMD ["python", "-c", "import ec2_scraping; print(ec2_scraping.__version__)"]
+ENTRYPOINT ["ec2-scrape"]
+CMD ["daemon"]

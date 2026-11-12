@@ -1,0 +1,17 @@
+[Unit]
+Description=EC2 Scraping Inventory Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ec2-scraping
+EnvironmentFile=-/etc/ec2-scraping/ec2-scraping.env
+ExecStart=/opt/ec2-scraping/.venv/bin/ec2-scrape daemon
+Restart=on-failure
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
