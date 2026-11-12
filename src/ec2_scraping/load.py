@@ -39,6 +39,34 @@ def get_accessed_ssh_instance_ids(
     return set(db.scalars(stmt).all())
 
 
+def get_known_ssh_users(
+    db: Session, aws_account_id: str, region: str, instance_ids: list[str]
+) -> dict[str, str]:
+    """Return {instance_id: ssh_user} for instances in (account, region) with a known ssh_user."""
+    if not instance_ids:
+        return {}
+    stmt = select(Instance.instance_id, Instance.ssh_user).where(
+        Instance.aws_account_id == aws_account_id,
+        Instance.region == region,
+        Instance.instance_id.in_(instance_ids),
+        Instance.ssh_status == "succeeded",
+        Instance.ssh_user.is_not(None),
+    )
+    return {inst_id: user for inst_id, user in db.execute(stmt).all() if user}
+
+
+def get_known_ami_ssh_users(db: Session, image_ids: list[str]) -> dict[str, str]:
+    """Return {image_id: ssh_user} for AMIs that previously succeeded over SSH."""
+    if not image_ids:
+        return {}
+    stmt = select(Instance.image_id, Instance.ssh_user).where(
+        Instance.image_id.in_(image_ids),
+        Instance.ssh_status == "succeeded",
+        Instance.ssh_user.is_not(None),
+    )
+    return {img_id: user for img_id, user in db.execute(stmt).all() if img_id and user}
+
+
 def load_instances(
     db: Session,
     aws_account_id: str,

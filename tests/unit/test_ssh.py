@@ -119,14 +119,35 @@ def test_parse_probe_output_extracts_all_sections():
     [
         ("CentOS Stream 9", "centos"),
         ("amzn2-ami-hvm", "ec2-user"),
-        ("ubuntu/images/hvm-ssd/ubuntu-noble-24.04", ssh.DEFAULT_SSH_USERS[0]),
+        ("ubuntu/images/hvm-ssd/ubuntu-noble-24.04", "ubuntu"),
     ],
 )
 def test_ordered_candidate_users_prioritizes_distro_hint(ami_name, expected_first):
     users = ssh.ordered_candidate_users(_inst(), ami_name=ami_name)
     assert users[0] == expected_first
-    assert len(users) == len(ssh.DEFAULT_SSH_USERS)
-    assert set(users) == set(ssh.DEFAULT_SSH_USERS)
+    assert set(ssh.DEFAULT_SSH_USERS).issubset(set(users))
+
+    # When explicit custom users are given, distro hints outside that set are not injected
+    restricted = ssh.ordered_candidate_users(
+        _inst(), users=("admin", "root"), ami_name="ubuntu/images/hvm-ssd/ubuntu-noble-24.04"
+    )
+    assert restricted == ["admin", "root"]
+
+
+def test_ordered_candidate_users_prioritizes_last_known_user():
+    # Even when AMI hints at amzn/ec2-user, last_known_user and ami_known_user come first
+    users = ssh.ordered_candidate_users(
+        _inst(),
+        ami_name="amzn2-ami-hvm",
+        last_known_user="centos",
+        ami_known_user="ubuntu",
+    )
+    assert users[:3] == ["centos", "ubuntu", "ec2-user"]
+
+    # Custom user not in DEFAULT_SSH_USERS is still tried first
+    custom = ssh.ordered_candidate_users(_inst(), last_known_user="deploy")
+    assert custom[0] == "deploy"
+    assert custom[1:] == list(ssh.DEFAULT_SSH_USERS)
 
 
 def test_resolve_target_host_and_client_keys(tmp_path):
@@ -183,7 +204,7 @@ def test_ssh_collector_rotates_users_and_handles_states():
         _inst(instance_id="i-stopped", state="stopped"),
         _inst(instance_id="i-win", platform="windows"),
         _inst(instance_id="i-noip", private_ip=None, public_ip=None),
-        _inst(instance_id="i-timeout", private_ip="10.0.0.99"),
+        _inst(instance_id="i-timeout", private_ip="10.0.0.99", image_id="ami-other"),
     ]
     results = collector.enrich_batch("111111111111", "us-east-1", instances)
 
@@ -316,3 +337,93 @@ def test_ssh_only_unaccessed_skips_succeeded_and_preserves_previous_data(monkeyp
     assert existing_accessed.ssh_facts == {"ssh_user": "ec2-user", "os_id": "amzn"}
     assert rows_by_id["i-new"].ssh_user == "ubuntu"
     assert rows_by_id["i-new"].ssh_os_id == "ubuntu"
+
+
+def test_ssh_retries_last_known_user_first():
+    attempts: list[tuple[str, str]] = []
+
+    @asynccontextmanager
+    async def fake_connect(**kwargs):
+        host = kwargs["host"]
+        user = kwargs["username"]
+        attempts.append((host, user))
+        if user != "debian":
+            raise asyncssh.PermissionDenied("Permission denied")
+
+        class Conn:
+            async def run(self, script, check=False):
+                return SimpleNamespace(stdout=SAMPLE_PROBE_OUTPUT)
+
+        yield Conn()
+
+    inst = _inst(instance_id="i-known", private_ip="10.0.0.10")
+    data = Collected(instances=[inst])
+
+    db = MagicMock()
+    db.execute.side_effect = [
+        SimpleNamespace(all=lambda: [("i-known", "debian")]),
+        SimpleNamespace(all=lambda: []),
+    ]
+
+    collector = ssh.SshCollector(
+        users=("ec2-user", "ubuntu", "debian"),
+        connect_fn=fake_connect,
+    )
+    enrichments = runner._run_enrichers(db, "111111111111", "us-east-1", data, [collector])
+
+    assert attempts == [("10.0.0.10", "debian")]
+    res = enrichments["i-known"]["ssh"]
+    assert res.status == "succeeded"
+    assert res.facts is not None
+    assert res.facts["ssh_user"] == "debian"
+    assert res.facts["attempted_users"] == ["debian"]
+
+
+def test_ssh_live_ami_learning_and_cached_keys(tmp_path):
+    attempts: list[tuple[str, str]] = []
+    seen_kwargs: list[dict[str, Any]] = []
+
+    @asynccontextmanager
+    async def fake_connect(**kwargs):
+        host = kwargs["host"]
+        user = kwargs["username"]
+        attempts.append((host, user))
+        seen_kwargs.append(kwargs)
+        if user != "centos":
+            raise asyncssh.PermissionDenied("Permission denied")
+
+        class Conn:
+            async def run(self, script, check=False):
+                return SimpleNamespace(stdout=SAMPLE_PROBE_OUTPUT)
+
+        yield Conn()
+
+    key_dir = tmp_path / "keys"
+    key_dir.mkdir()
+    pem = key_dir / "my-key.pem"
+    pem.write_text("DUMMY_KEY")
+
+    # Concurrency=1 ensures i-1 finishes and populates learned_ami_users before i-2 starts
+    collector = ssh.SshCollector(
+        users=("root", "admin", "ec2-user", "centos"),
+        key_dir=key_dir,
+        concurrency=1,
+        connect_timeout=3.5,
+        connect_fn=fake_connect,
+    )
+
+    instances = [
+        _inst(instance_id="i-1", private_ip="10.0.0.1", image_id="ami-shared"),
+        _inst(instance_id="i-2", private_ip="10.0.0.2", image_id="ami-shared"),
+    ]
+    results = collector.enrich_batch("111111111111", "us-east-1", instances)
+
+    assert results["i-1"].facts is not None
+    assert results["i-1"].facts["attempted_users"] == ["root", "admin", "ec2-user", "centos"]
+    # Second instance with same AMI immediately tries 'centos' first
+    assert results["i-2"].facts is not None
+    assert results["i-2"].facts["attempted_users"] == ["centos"]
+    assert seen_kwargs[0]["connect_timeout"] == 3.5
+    assert seen_kwargs[0]["login_timeout"] == 3.5
+    assert collector._load_key_cached(str(pem)) == str(pem)
+    assert collector._load_key_cached(str(pem)) == str(pem)

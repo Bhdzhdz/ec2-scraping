@@ -42,8 +42,13 @@ grep -E '^(MemTotal|MemAvailable|SwapTotal):' /proc/meminfo 2>/dev/null || true
 echo "===SECTION:DISK==="
 df -P -k / 2>/dev/null | tail -n 1 || true
 echo "===SECTION:PKGS==="
-if command -v dpkg-query >/dev/null 2>&1; then
+if [ -f /var/lib/dpkg/status ]; then
+  grep -c '^Status: install ok installed$' /var/lib/dpkg/status 2>/dev/null || true
+elif command -v dpkg-query >/dev/null 2>&1; then
   dpkg-query -f '.\n' -W 2>/dev/null | wc -l
+elif [ -f /var/lib/rpm/rpmdb.sqlite ] && command -v sqlite3 >/dev/null 2>&1; then
+  sqlite3 /var/lib/rpm/rpmdb.sqlite 'SELECT count(*) FROM Packages;' 2>/dev/null \
+    || rpm -qa 2>/dev/null | wc -l
 elif command -v rpm >/dev/null 2>&1; then
   rpm -qa 2>/dev/null | wc -l
 elif command -v apk >/dev/null 2>&1; then
@@ -137,8 +142,10 @@ def ordered_candidate_users(
     inst: InstanceRecord,
     users: Sequence[str] = DEFAULT_SSH_USERS,
     ami_name: str | None = None,
+    last_known_user: str | None = None,
+    ami_known_user: str | None = None,
 ) -> list[str]:
-    """Order candidate usernames, prioritizing likely OS matches from AMI/platform hints."""
+    """Order candidate usernames, prioritizing known users and likely OS matches."""
     hint = f"{ami_name or ''} {inst.platform_details or ''}".lower()
     prioritized: list[str] = []
     if "ubuntu" in hint:
@@ -160,9 +167,16 @@ def ordered_candidate_users(
     elif "amzn" in hint or "amazon" in hint or "rhel" in hint:
         prioritized.append("ec2-user")
 
+    allow_any_hint = tuple(users) == DEFAULT_SSH_USERS
     ordered: list[str] = []
-    for u in (*prioritized, *users):
-        if u and u in users and u not in ordered:
+    for known in (last_known_user, ami_known_user):
+        if known and known not in ordered:
+            ordered.append(known)
+    for u in prioritized:
+        if u and (allow_any_hint or u in users) and u not in ordered:
+            ordered.append(u)
+    for u in users:
+        if u and u not in ordered:
             ordered.append(u)
     return ordered
 
@@ -333,23 +347,110 @@ class SshCollector:
         self.prefer_public_ip = prefer_public_ip
         self.only_unaccessed = only_unaccessed
         self.connect_fn = connect_fn
+        self._file_exists_cache: dict[str, bool] = {}
+        self._dir_files_cache: dict[str, list[str]] = {}
+        self._parsed_key_cache: dict[str, asyncssh.SSHKey | str] = {}
+
+    def _is_file_cached(self, p: Path) -> tuple[str, bool]:
+        resolved = str(p.expanduser())
+        exists = self._file_exists_cache.get(resolved)
+        if exists is None:
+            exists = p.expanduser().is_file()
+            self._file_exists_cache[resolved] = exists
+        return resolved, exists
+
+    def _dir_keys_cached(self, key_dir: str | Path) -> list[str]:
+        base = Path(key_dir).expanduser()
+        key = str(base)
+        cached = self._dir_files_cache.get(key)
+        if cached is not None:
+            return cached
+        files: list[str] = []
+        if base.is_dir():
+            for child in sorted(base.iterdir()):
+                if child.is_file() and not child.name.endswith(".pub"):
+                    resolved = str(child)
+                    self._file_exists_cache[resolved] = True
+                    files.append(resolved)
+        self._dir_files_cache[key] = files
+        return files
+
+    def _load_key_cached(self, path: str) -> asyncssh.SSHKey | str:
+        cached = self._parsed_key_cache.get(path)
+        if cached is not None:
+            return cached
+        try:
+            loaded: asyncssh.SSHKey | str = asyncssh.read_private_key(path)
+        except (asyncssh.KeyImportError, OSError):
+            loaded = path
+        self._parsed_key_cache[path] = loaded
+        return loaded
+
+    def _resolve_cached_client_keys(self, inst: InstanceRecord) -> Sequence[asyncssh.SSHKey | str]:
+        found: list[str] = []
+        seen: set[str] = set()
+
+        def _add_path(p: Path) -> None:
+            resolved, exists = self._is_file_cached(p)
+            if exists and resolved not in seen:
+                seen.add(resolved)
+                found.append(resolved)
+
+        if self.key_dir and inst.key_name:
+            base = Path(self.key_dir).expanduser()
+            for candidate in (base / inst.key_name, base / f"{inst.key_name}.pem"):
+                _add_path(candidate)
+
+        for kf in self.key_files:
+            _add_path(Path(kf))
+
+        if self.key_dir:
+            for resolved in self._dir_keys_cached(self.key_dir):
+                if resolved not in seen:
+                    seen.add(resolved)
+                    found.append(resolved)
+
+        ssh_dir = Path.home() / ".ssh"
+        for name in DEFAULT_KEY_NAMES:
+            _add_path(ssh_dir / name)
+
+        if self.connect_fn is asyncssh.connect:
+            return [self._load_key_cached(p) for p in found]
+        return found
+
+    def _check_skippable(self, inst: InstanceRecord) -> tuple[str | None, EnrichmentResult | None]:
+        if inst.state != "running":
+            return None, EnrichmentResult(status="skipped", error=f"instance state is {inst.state}")
+        if (inst.platform or "").lower() == "windows":
+            return None, EnrichmentResult(status="skipped", error="windows platform skipped")
+        host = resolve_target_host(inst, prefer_public_ip=self.prefer_public_ip)
+        if not host:
+            return None, EnrichmentResult(status="skipped", error="no reachable IP or DNS name")
+        return host, None
 
     async def _probe_instance(
         self,
         inst: InstanceRecord,
         ami_name: str | None = None,
+        last_known_user: str | None = None,
+        ami_known_user: str | None = None,
+        learned_ami_users: dict[str, str] | None = None,
     ) -> EnrichmentResult:
-        if inst.state != "running":
-            return EnrichmentResult(status="skipped", error=f"instance state is {inst.state}")
-        if (inst.platform or "").lower() == "windows":
-            return EnrichmentResult(status="skipped", error="windows platform skipped")
+        host, skip_res = self._check_skippable(inst)
+        if skip_res is not None or host is None:
+            return skip_res or EnrichmentResult(status="skipped", error="no reachable IP")
 
-        host = resolve_target_host(inst, prefer_public_ip=self.prefer_public_ip)
-        if not host:
-            return EnrichmentResult(status="skipped", error="no reachable IP or DNS name")
-
-        client_keys = resolve_client_keys(inst, self.key_files, self.key_dir)
-        candidates = ordered_candidate_users(inst, self.users, ami_name)
+        effective_ami_user = ami_known_user or (
+            learned_ami_users.get(inst.image_id) if learned_ami_users and inst.image_id else None
+        )
+        client_keys = self._resolve_cached_client_keys(inst)
+        candidates = ordered_candidate_users(
+            inst,
+            self.users,
+            ami_name,
+            last_known_user=last_known_user,
+            ami_known_user=effective_ami_user,
+        )
 
         tried_errors: list[str] = []
         for user in candidates:
@@ -360,6 +461,7 @@ class SshCollector:
                     "username": user,
                     "known_hosts": None,
                     "preferred_auth": "publickey",
+                    "connect_timeout": self.connect_timeout,
                     "login_timeout": self.connect_timeout,
                 }
                 if client_keys:
@@ -373,6 +475,8 @@ class SshCollector:
                     stdout = res.stdout if isinstance(res.stdout, str) else str(res.stdout or "")
                     facts = parse_probe_output(stdout, user, host, self.port)
                     facts["attempted_users"] = candidates[: candidates.index(user) + 1]
+                    if learned_ami_users is not None and inst.image_id:
+                        learned_ami_users.setdefault(inst.image_id, user)
                     return EnrichmentResult(status="succeeded", facts=facts)
             except asyncssh.PermissionDenied as exc:
                 tried_errors.append(f"{user}: {exc}")
@@ -398,13 +502,25 @@ class SshCollector:
         region: str,
         instances: Sequence[InstanceRecord],
         ami_names: dict[str, str | None] | None = None,
+        known_users: dict[str, str] | None = None,
+        known_ami_users: dict[str, str] | None = None,
     ) -> dict[str, EnrichmentResult]:
         sem = asyncio.Semaphore(self.concurrency)
         ami_names = ami_names or {}
+        known_users = known_users or {}
+        learned_ami_users: dict[str, str] = dict(known_ami_users or {})
 
         async def _guarded(inst: InstanceRecord) -> tuple[str, EnrichmentResult]:
+            _, skip_res = self._check_skippable(inst)
+            if skip_res is not None:
+                return inst.instance_id, skip_res
             async with sem:
-                res = await self._probe_instance(inst, ami_names.get(inst.image_id))
+                res = await self._probe_instance(
+                    inst,
+                    ami_names.get(inst.image_id),
+                    last_known_user=known_users.get(inst.instance_id),
+                    learned_ami_users=learned_ami_users,
+                )
                 return inst.instance_id, res
 
         pairs = await asyncio.gather(*(_guarded(i) for i in instances))
@@ -416,10 +532,20 @@ class SshCollector:
         region: str,
         instances: Sequence[InstanceRecord],
         ami_names: dict[str, str | None] | None = None,
+        known_users: dict[str, str] | None = None,
+        known_ami_users: dict[str, str] | None = None,
     ) -> dict[str, EnrichmentResult]:
-        return asyncio.run(self.enrich_many_async(aws_account_id, region, instances, ami_names))
+        return asyncio.run(
+            self.enrich_many_async(
+                aws_account_id, region, instances, ami_names, known_users, known_ami_users
+            )
+        )
 
     def enrich(
-        self, aws_account_id: str, region: str, instance: InstanceRecord
+        self,
+        aws_account_id: str,
+        region: str,
+        instance: InstanceRecord,
+        last_known_user: str | None = None,
     ) -> EnrichmentResult:
-        return asyncio.run(self._probe_instance(instance))
+        return asyncio.run(self._probe_instance(instance, last_known_user=last_known_user))

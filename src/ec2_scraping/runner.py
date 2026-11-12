@@ -47,18 +47,31 @@ def _run_enrichers(
     ami_names = {k: v.name for k, v in data.amis.items()}
     for enricher in enrichers:
         targets = data.instances
-        if enricher.name == "ssh" and getattr(enricher, "only_unaccessed", False):
-            already_accessed = load.get_accessed_ssh_instance_ids(
-                db, aws_account_id, region, [i.instance_id for i in data.instances]
-            )
-            targets = [i for i in data.instances if i.instance_id not in already_accessed]
-            if not targets:
-                continue
+        known_users: dict[str, str] = {}
+        known_ami_users: dict[str, str] = {}
+        if enricher.name == "ssh":
+            inst_ids = [i.instance_id for i in data.instances]
+            if getattr(enricher, "only_unaccessed", False):
+                already_accessed = load.get_accessed_ssh_instance_ids(
+                    db, aws_account_id, region, inst_ids
+                )
+                targets = [i for i in data.instances if i.instance_id not in already_accessed]
+                if not targets:
+                    continue
+            else:
+                known_users = load.get_known_ssh_users(db, aws_account_id, region, inst_ids)
+            image_ids = list({i.image_id for i in targets if i.image_id})
+            known_ami_users = load.get_known_ami_ssh_users(db, image_ids)
 
         batch_fn = getattr(enricher, "enrich_batch", None)
         if callable(batch_fn):
             try:
-                batch_res = batch_fn(aws_account_id, region, targets, ami_names)
+                batch_kwargs = (
+                    {"known_users": known_users, "known_ami_users": known_ami_users}
+                    if enricher.name == "ssh"
+                    else {}
+                )
+                batch_res = batch_fn(aws_account_id, region, targets, ami_names, **batch_kwargs)
                 for inst_id, res in batch_res.items():
                     if inst_id in results:
                         results[inst_id][enricher.name] = res
