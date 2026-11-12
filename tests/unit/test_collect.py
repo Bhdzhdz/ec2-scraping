@@ -1,6 +1,7 @@
 """Collection against a stubbed EC2 client: paging, optional fields, read-only calls."""
 
 from datetime import datetime
+from typing import Any
 
 import boto3
 import pytest
@@ -13,13 +14,16 @@ ACCOUNT = "111111111111"
 LAUNCH = datetime(2026, 1, 2, 3, 4, 5)
 
 
-def _client():
+def _client() -> Any:
     return boto3.client(
-        "ec2", region_name="us-east-1", aws_access_key_id="x", aws_secret_access_key="x"
+        "ec2",
+        region_name="us-east-1",
+        aws_access_key_id="x",
+        aws_secret_access_key="x",  # noqa: S106
     )
 
 
-def _full_instance():
+def _full_instance() -> dict[str, Any]:
     return {
         "InstanceId": "i-1",
         "InstanceType": "g4dn.xlarge",
@@ -88,7 +92,7 @@ def _full_instance():
     }
 
 
-def _minimal_instance():
+def _minimal_instance() -> dict[str, Any]:
     return {
         "InstanceId": "i-2",
         "InstanceType": "t3.small",
@@ -99,7 +103,7 @@ def _minimal_instance():
     }
 
 
-def _ami(image_id="ami-1"):
+def _ami(image_id: str = "ami-1") -> dict[str, Any]:
     return {
         "ImageId": image_id,
         "OwnerId": ACCOUNT,
@@ -180,7 +184,34 @@ def _stub_full(stub: Stubber, ami9_error: str = "InvalidAMIID.NotFound") -> None
     )
 
 
-def test_collects_all_pages_and_maps_analytics_fields():
+def _assert_full_and_minimal(data: Any) -> None:
+    assert [i.instance_id for i in data.instances] == ["i-1", "i-2"]
+    full, minimal = data.instances
+    assert (full.name, full.lifecycle, full.tenancy, full.placement_group) == (
+        "web",
+        "spot",
+        "dedicated",
+        "pg-1",
+    )
+    assert full.tags == {"Name": "web", "env": "dev"}
+    assert (full.cpu_core_count, full.cpu_threads_per_core) == (2, 2)
+    assert (full.imds_http_tokens, full.ipv6_address, full.public_ip) == (
+        "required",
+        "2001:db8::1",
+        "1.2.3.4",
+    )
+    assert full.network_interfaces[0].mac_address == "0a:1b:2c:3d:4e:5f"
+    assert full.volumes[0].volume_id == "vol-1"
+    assert (minimal.name, minimal.lifecycle, minimal.tenancy, minimal.vpc_id, minimal.tags) == (
+        None,
+        "on-demand",
+        "default",
+        None,
+        {},
+    )
+
+
+def test_collects_all_pages_and_maps_analytics_fields() -> None:
     ec2 = _client()
     operations: list[str] = []
     ec2.meta.events.register(
@@ -191,45 +222,30 @@ def test_collects_all_pages_and_maps_analytics_fields():
         data = collect(ec2, ACCOUNT)
         stub.assert_no_pending_responses()
 
-    assert [i.instance_id for i in data.instances] == ["i-1", "i-2"]
-    full, minimal = data.instances
-    assert full.name == "web"
-    assert full.tags == {"Name": "web", "env": "dev"}
-    assert full.lifecycle == "spot"
-    assert full.tenancy == "dedicated"
-    assert full.placement_group == "pg-1"
-    assert (full.cpu_core_count, full.cpu_threads_per_core) == (2, 2)
-    assert full.imds_http_tokens == "required"
-    assert full.ipv6_address == "2001:db8::1"
-    assert full.public_ip == "1.2.3.4"
-    assert full.network_interfaces[0].mac_address == "0a:1b:2c:3d:4e:5f"
-    assert full.volumes[0].volume_id == "vol-1"
-
-    assert minimal.name is None
-    assert minimal.lifecycle == "on-demand"
-    assert minimal.tenancy == "default"
-    assert minimal.vpc_id is None
-    assert minimal.tags == {}
-
+    _assert_full_and_minimal(data)
     assert list(data.amis) == ["ami-1"]
     assert data.amis["ami-1"].platform_details == "Linux/UNIX"
 
     tinfo = data.type_info["g4dn.xlarge"]
-    assert (tinfo.vcpu, tinfo.memory_mib) == (4, 16384)
-    assert (tinfo.gpu_count, tinfo.gpu_model) == (1, "NVIDIA T4")
-    assert tinfo.instance_storage_gib == 125
-    assert tinfo.network_performance == "Up to 25 Gigabit"
+    assert (tinfo.vcpu, tinfo.memory_mib, tinfo.gpu_count, tinfo.gpu_model) == (
+        4,
+        16384,
+        1,
+        "NVIDIA T4",
+    )
+    assert (tinfo.instance_storage_gib, tinfo.network_performance) == (125, "Up to 25 Gigabit")
 
     vinfo = data.volume_info["vol-1"]
     assert (vinfo.size_gib, vinfo.volume_type, vinfo.encrypted) == (50, "gp3", True)
-
-    assert data.vpc_cidrs == {"vpc-1": "10.0.0.0/16"}
-    assert data.subnet_cidrs == {"subnet-1": "10.0.0.0/24"}
+    assert (data.vpc_cidrs, data.subnet_cidrs) == (
+        {"vpc-1": "10.0.0.0/16"},
+        {"subnet-1": "10.0.0.0/24"},
+    )
     assert operations
     assert all(op.startswith("Describe") for op in operations)
 
 
-def test_unexpected_ami_error_is_not_swallowed():
+def test_unexpected_ami_error_is_not_swallowed() -> None:
     ec2 = _client()
     with Stubber(ec2) as stub:
         stub.add_response(
@@ -242,7 +258,7 @@ def test_unexpected_ami_error_is_not_swallowed():
             collect(ec2, ACCOUNT)
 
 
-def test_tolerated_client_errors_fall_back_per_item():
+def test_tolerated_client_errors_fall_back_per_item() -> None:
     ec2 = _client()
     inst1 = _full_instance()
     inst2 = {
@@ -345,13 +361,13 @@ def test_tolerated_client_errors_fall_back_per_item():
     assert data.subnet_cidrs == {"subnet-1": "10.0.0.0/24"}
 
 
-def test_clients_use_adaptive_retries():
-    calls = []
+def test_clients_use_adaptive_retries() -> None:
+    calls: list[dict[str, Any]] = []
 
     class FakeBoto:
         region_name = "us-east-1"
 
-        def client(self, name, **kwargs):
+        def client(self, _name: str, **kwargs: Any) -> object:
             calls.append(kwargs)
             return object()
 

@@ -1,14 +1,17 @@
+from typing import Any
+
 import pymysql
 import pytest
 
 from .conftest import add_instance, apply_migrations, fetch
 
 
-def test_migrations_apply_twice(db, dsn):
+def test_migrations_apply_twice(db: Any, dsn: str) -> None:
+    assert db is not None
     apply_migrations(dsn)  # second application must not fail
 
 
-def test_only_instance_table_and_analytics_view_created(db):
+def test_only_instance_table_and_analytics_view_created(db: Any) -> None:
     base_tables = {
         r["TABLE_NAME"]
         for r in fetch(
@@ -30,7 +33,7 @@ def test_only_instance_table_and_analytics_view_created(db):
     assert views == {"v_instance_analytics"}
 
 
-def test_instance_unique_key(db):
+def test_instance_unique_key(db: Any) -> None:
     add_instance(db, "i-1")
     with pytest.raises(pymysql.err.IntegrityError):
         add_instance(db, "i-1")

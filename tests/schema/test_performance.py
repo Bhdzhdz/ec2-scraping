@@ -1,9 +1,10 @@
 import time
+from typing import Any
 
 N = 100_000
 
 
-def test_lookups_under_two_seconds(db):
+def test_lookups_under_two_seconds(db: Any) -> None:
     rows = [
         (
             "111111111111",

@@ -1,5 +1,9 @@
 """SSO profile sessions: validity check, account id, regions."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
 import boto3
 from botocore.config import Config
 from botocore.exceptions import (
@@ -9,6 +13,9 @@ from botocore.exceptions import (
     UnauthorizedSSOTokenError,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 CLIENT_CONFIG = Config(retries={"mode": "adaptive", "max_attempts": 10})
 _EXPIRED_CODES = {"ExpiredToken", "ExpiredTokenException"}
 
@@ -16,7 +23,7 @@ _EXPIRED_CODES = {"ExpiredToken", "ExpiredTokenException"}
 class SsoLoginRequired(Exception):
     """The profile's SSO session is missing or expired."""
 
-    def __init__(self, profile: str):
+    def __init__(self, profile: str) -> None:
         self.profile = profile
         super().__init__(
             f"SSO session invalid for profile '{profile}': run `aws sso login --profile {profile}`"
@@ -26,7 +33,7 @@ class SsoLoginRequired(Exception):
 class ProfileSession:
     """A validated boto3 session plus the resolved account id."""
 
-    def __init__(self, profile: str, boto_session, account_id: str):
+    def __init__(self, profile: str, boto_session: Any, account_id: str) -> None:
         self.profile = profile
         self.boto = boto_session
         self.account_id = account_id
@@ -35,11 +42,13 @@ class ProfileSession:
     def default_region(self) -> str | None:
         return self.boto.region_name
 
-    def ec2(self, region: str):
+    def ec2(self, region: str) -> Any:
         return self.boto.client("ec2", region_name=region, config=CLIENT_CONFIG)
 
 
-def open_session(profile: str, session_factory=boto3.Session) -> ProfileSession:
+def open_session(
+    profile: str, session_factory: Callable[..., Any] = boto3.Session
+) -> ProfileSession:
     """Create a session for ``profile`` and resolve its account id (read-only STS call)."""
     try:
         boto_session = session_factory(profile_name=profile)

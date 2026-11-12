@@ -1,6 +1,9 @@
 """Fixtures that apply Alembic migrations to a disposable MariaDB/MySQL database."""
 
+from __future__ import annotations
+
 import os
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import pymysql
@@ -9,8 +12,11 @@ import pytest
 
 from ec2_scraping.db.session import upgrade_db
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
-def _connect(dsn: str, database: str | None):
+
+def _connect(dsn: str, database: str | None) -> Any:
     u = urlparse(dsn)
     return pymysql.connect(
         host=u.hostname,
@@ -36,7 +42,7 @@ def dsn() -> str:
 
 
 @pytest.fixture
-def db(dsn):
+def db(dsn: str) -> Iterator[Any]:
     name = urlparse(dsn).path.lstrip("/")
     root = _connect(dsn, None)
     with root.cursor() as cur:
@@ -49,38 +55,39 @@ def db(dsn):
     conn.close()
 
 
-def insert(conn, sql: str, args=()) -> int:
+def insert(conn: Any, sql: str, args: tuple[Any, ...] = ()) -> int:
     with conn.cursor() as cur:
         cur.execute(sql, args)
         return cur.lastrowid
 
 
-def fetch(conn, sql: str, args=()) -> list[dict]:
+def fetch(conn: Any, sql: str, args: tuple[Any, ...] = ()) -> list[dict]:
     with conn.cursor() as cur:
         cur.execute(sql, args)
         return list(cur.fetchall())
 
 
 def add_instance(
-    conn,
+    conn: Any,
     instance_id: str = "i-1",
     image_id: str = "ami-1",
     aws_account_id: str = "111111111111",
     region: str = "us-east-1",
-    **extra,
+    **extra: Any,
 ) -> int:
-    cols = dict(
-        aws_account_id=aws_account_id,
-        region=region,
-        instance_id=instance_id,
-        instance_type="t3.micro",
-        availability_zone="us-east-1a",
-        image_id=image_id,
-        state="running",
-        architecture="x86_64",
-        launch_time="2026-01-01 00:00:00",
-    )
-    cols.update(extra)
+    cols = {
+        "aws_account_id": aws_account_id,
+        "region": region,
+        "instance_id": instance_id,
+        "instance_type": "t3.micro",
+        "availability_zone": "us-east-1a",
+        "image_id": image_id,
+        "state": "running",
+        "architecture": "x86_64",
+        "launch_time": "2026-01-01 00:00:00",
+        **extra,
+    }
     names = ", ".join(cols)
     marks = ", ".join(["%s"] * len(cols))
-    return insert(conn, f"INSERT INTO instance ({names}) VALUES ({marks})", tuple(cols.values()))
+    sql = f"INSERT INTO instance ({names}) VALUES ({marks})"  # noqa: S608
+    return insert(conn, sql, tuple(cols.values()))

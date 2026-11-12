@@ -1,13 +1,31 @@
 """Async SSH collector: probes common usernames and gathers OS/system facts."""
 
+from __future__ import annotations
+
 import asyncio
-from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import asyncssh
 
-from ec2_scraping.models import EnrichmentResult, InstanceRecord
+from ec2_scraping.models import EnrichmentResult
+from ec2_scraping.ssh_probe import PROBE_SCRIPT, parse_probe_output
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Sequence
+
+    from ec2_scraping.models import InstanceRecord
+
+__all__ = [
+    "DEFAULT_KEY_NAMES",
+    "DEFAULT_SSH_USERS",
+    "PROBE_SCRIPT",
+    "SshCollector",
+    "ordered_candidate_users",
+    "parse_probe_output",
+    "resolve_client_keys",
+    "resolve_target_host",
+]
 
 DEFAULT_SSH_USERS: tuple[str, ...] = (
     "root",
@@ -23,68 +41,20 @@ DEFAULT_KEY_NAMES: tuple[str, ...] = (
     "id_dsa",
 )
 
-PROBE_SCRIPT = r"""
-echo "===SECTION:OS_RELEASE==="
-cat /etc/os-release 2>/dev/null || cat /usr/lib/os-release 2>/dev/null || true
-echo "===SECTION:UNAME==="
-uname -s -r -m 2>/dev/null || true
-echo "===SECTION:HOSTNAME==="
-hostname -f 2>/dev/null || hostname 2>/dev/null || true
-echo "===SECTION:UPTIME==="
-cat /proc/uptime 2>/dev/null || true
-echo "===SECTION:LOADAVG==="
-cat /proc/loadavg 2>/dev/null || true
-echo "===SECTION:CPU==="
-grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- \
-  || lscpu 2>/dev/null | grep -m1 'Model name:' | cut -d: -f2- || true
-echo "===SECTION:MEM==="
-grep -E '^(MemTotal|MemAvailable|SwapTotal):' /proc/meminfo 2>/dev/null || true
-echo "===SECTION:DISK==="
-df -P -k / 2>/dev/null | tail -n 1 || true
-echo "===SECTION:PKGS==="
-if [ -f /var/lib/dpkg/status ]; then
-  grep -c '^Status: install ok installed$' /var/lib/dpkg/status 2>/dev/null || true
-elif command -v dpkg-query >/dev/null 2>&1; then
-  dpkg-query -f '.\n' -W 2>/dev/null | wc -l
-elif [ -f /var/lib/rpm/rpmdb.sqlite ] && command -v sqlite3 >/dev/null 2>&1; then
-  sqlite3 /var/lib/rpm/rpmdb.sqlite 'SELECT count(*) FROM Packages;' 2>/dev/null \
-    || rpm -qa 2>/dev/null | wc -l
-elif command -v rpm >/dev/null 2>&1; then
-  rpm -qa 2>/dev/null | wc -l
-elif command -v apk >/dev/null 2>&1; then
-  apk info 2>/dev/null | wc -l
-fi
-echo "===SECTION:SERVICES==="
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl list-units --type=service --state=running --no-legend --no-pager 2>/dev/null \
-    | awk '{print $1}' | head -n 50
-fi
-echo "===SECTION:PORTS==="
-if command -v ss >/dev/null 2>&1; then
-  ss -tlnH 2>/dev/null | awk '{print $4}'
-elif command -v netstat >/dev/null 2>&1; then
-  netstat -tln 2>/dev/null | awk 'NR>2 {print $4}'
-fi
-echo "===SECTION:CONTAINERS==="
-if command -v docker >/dev/null 2>&1; then
-  docker ps --format '{{.Names}}|{{.Image}}' 2>/dev/null || true
-elif command -v podman >/dev/null 2>&1; then
-  podman ps --format '{{.Names}}|{{.Image}}' 2>/dev/null || true
-fi
-echo "===SECTION:REBOOT==="
-if [ -f /var/run/reboot-required ] || [ -f /run/reboot-required ]; then
-  echo "yes"
-elif command -v needs-restarting >/dev/null 2>&1; then
-  needs-restarting -r >/dev/null 2>&1 && echo "no" || echo "yes"
-else
-  echo "no"
-fi
-echo "===SECTION:USERS==="
-who 2>/dev/null | awk '{print $1}' | sort -u || true
-echo "===SECTION:SUDO==="
-sudo -n true >/dev/null 2>&1 && echo "yes" || echo "no"
-echo "===SECTION:END==="
-""".strip()
+_DISTRO_USER_HINTS: tuple[tuple[str, str], ...] = (
+    ("ubuntu", "ubuntu"),
+    ("debian", "debian"),
+    ("centos", "centos"),
+    ("fedora", "fedora"),
+    ("rocky", "rocky"),
+    ("alma", "almalinux"),
+    ("suse", "suse"),
+    ("sles", "suse"),
+    ("bitnami", "bitnami"),
+    ("amzn", "ec2-user"),
+    ("amazon", "ec2-user"),
+    ("rhel", "ec2-user"),
+)
 
 
 def resolve_target_host(inst: InstanceRecord, *, prefer_public_ip: bool = False) -> str | None:
@@ -100,6 +70,27 @@ def resolve_target_host(inst: InstanceRecord, *, prefer_public_ip: bool = False)
     return None
 
 
+def _key_candidates(
+    inst: InstanceRecord,
+    key_files: Sequence[str | Path],
+    key_dir: str | Path | None,
+    ssh_dir: Path,
+) -> list[Path]:
+    candidates: list[Path] = []
+    if key_dir and inst.key_name:
+        base = Path(key_dir).expanduser()
+        candidates.extend((base / inst.key_name, base / f"{inst.key_name}.pem"))
+    candidates.extend(Path(kf) for kf in key_files)
+    if key_dir:
+        base = Path(key_dir).expanduser()
+        if base.is_dir():
+            candidates.extend(
+                c for c in sorted(base.iterdir()) if c.is_file() and not c.name.endswith(".pub")
+            )
+    candidates.extend(ssh_dir / name for name in DEFAULT_KEY_NAMES)
+    return candidates
+
+
 def resolve_client_keys(
     inst: InstanceRecord,
     key_files: Sequence[str | Path] = (),
@@ -107,35 +98,33 @@ def resolve_client_keys(
     default_ssh_dir: Path | None = None,
 ) -> list[str]:
     """Build ordered list of existing private key paths to offer for ``inst``."""
+    ssh_dir = default_ssh_dir if default_ssh_dir is not None else Path.home() / ".ssh"
     found: list[str] = []
     seen: set[str] = set()
-
-    def _add(p: Path) -> None:
-        resolved = str(p.expanduser())
-        if resolved not in seen and p.expanduser().is_file():
+    for p in _key_candidates(inst, key_files, key_dir, ssh_dir):
+        exp = p.expanduser()
+        resolved = str(exp)
+        if resolved not in seen and exp.is_file():
             seen.add(resolved)
             found.append(resolved)
-
-    if key_dir and inst.key_name:
-        base = Path(key_dir).expanduser()
-        for candidate in (base / inst.key_name, base / f"{inst.key_name}.pem"):
-            _add(candidate)
-
-    for kf in key_files:
-        _add(Path(kf))
-
-    if key_dir:
-        base = Path(key_dir).expanduser()
-        if base.is_dir():
-            for child in sorted(base.iterdir()):
-                if child.is_file() and not child.name.endswith(".pub"):
-                    _add(child)
-
-    ssh_dir = default_ssh_dir if default_ssh_dir is not None else Path.home() / ".ssh"
-    for name in DEFAULT_KEY_NAMES:
-        _add(ssh_dir / name)
-
     return found
+
+
+def _hinted_user(hint: str) -> str | None:
+    for token, username in _DISTRO_USER_HINTS:
+        if token in hint:
+            return username
+    return None
+
+
+def _dedup_nonempty(items: Iterable[str | None]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
 
 
 def ordered_candidate_users(
@@ -147,175 +136,10 @@ def ordered_candidate_users(
 ) -> list[str]:
     """Order candidate usernames, prioritizing known users and likely OS matches."""
     hint = f"{ami_name or ''} {inst.platform_details or ''}".lower()
-    prioritized: list[str] = []
-    if "ubuntu" in hint:
-        prioritized.append("ubuntu")
-    elif "debian" in hint:
-        prioritized.append("debian")
-    elif "centos" in hint:
-        prioritized.append("centos")
-    elif "fedora" in hint:
-        prioritized.append("fedora")
-    elif "rocky" in hint:
-        prioritized.append("rocky")
-    elif "alma" in hint:
-        prioritized.append("almalinux")
-    elif "suse" in hint or "sles" in hint:
-        prioritized.append("suse")
-    elif "bitnami" in hint:
-        prioritized.append("bitnami")
-    elif "amzn" in hint or "amazon" in hint or "rhel" in hint:
-        prioritized.append("ec2-user")
-
+    distro_user = _hinted_user(hint)
     allow_any_hint = tuple(users) == DEFAULT_SSH_USERS
-    ordered: list[str] = []
-    for known in (last_known_user, ami_known_user):
-        if known and known not in ordered:
-            ordered.append(known)
-    for u in prioritized:
-        if u and (allow_any_hint or u in users) and u not in ordered:
-            ordered.append(u)
-    for u in users:
-        if u and u not in ordered:
-            ordered.append(u)
-    return ordered
-
-
-def _parse_os_release(raw: str) -> dict[str, str]:
-    info: dict[str, str] = {}
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        info[k.strip()] = v.strip().strip('"').strip("'")
-    return info
-
-
-def _parse_port(addr: str) -> int | None:
-    addr = addr.strip()
-    if not addr or ":" not in addr:
-        return None
-    port_str = addr.rsplit(":", 1)[-1]
-    return int(port_str) if port_str.isdigit() else None
-
-
-def parse_probe_output(output: str, user: str, host: str, port: int) -> dict[str, Any]:
-    """Parse structured probe output into analytical SSH facts."""
-    sections: dict[str, str] = {}
-    current: str | None = None
-    buf: list[str] = []
-    for line in output.splitlines():
-        if line.startswith("===SECTION:") and line.endswith("==="):
-            if current is not None:
-                sections[current] = "\n".join(buf).strip()
-            current = line.removeprefix("===SECTION:").removesuffix("===")
-            buf = []
-        elif current is not None:
-            buf.append(line)
-    if current is not None and current != "END":
-        sections[current] = "\n".join(buf).strip()
-
-    os_rel = _parse_os_release(sections.get("OS_RELEASE", ""))
-    uname_parts = sections.get("UNAME", "").split()
-    kernel = uname_parts[1] if len(uname_parts) >= 2 else (uname_parts[0] if uname_parts else None)
-    arch = uname_parts[2] if len(uname_parts) >= 3 else None
-
-    uptime_seconds: int | None = None
-    uptime_raw = sections.get("UPTIME", "").split()
-    if uptime_raw:
-        try:
-            uptime_seconds = int(float(uptime_raw[0]))
-        except ValueError:
-            uptime_seconds = None
-
-    load_avg: list[float] | None = None
-    load_parts = sections.get("LOADAVG", "").split()
-    if len(load_parts) >= 3:
-        try:
-            load_avg = [float(load_parts[0]), float(load_parts[1]), float(load_parts[2])]
-        except ValueError:
-            load_avg = None
-
-    mem_info: dict[str, int] = {}
-    for line in sections.get("MEM", "").splitlines():
-        if ":" in line:
-            k, rest = line.split(":", 1)
-            toks = rest.split()
-            if toks and toks[0].isdigit():
-                mem_info[k.strip()] = int(toks[0]) // 1024  # kB -> MiB
-
-    root_disk: dict[str, Any] | None = None
-    disk_parts = sections.get("DISK", "").split()
-    if len(disk_parts) >= 5 and disk_parts[1].isdigit() and disk_parts[2].isdigit():
-        total_kb = int(disk_parts[1])
-        used_kb = int(disk_parts[2])
-        avail_kb = int(disk_parts[3]) if disk_parts[3].isdigit() else None
-        pct_str = disk_parts[4].rstrip("%")
-        root_disk = {
-            "filesystem": disk_parts[0],
-            "total_mib": total_kb // 1024,
-            "used_mib": used_kb // 1024,
-            "avail_mib": avail_kb // 1024 if avail_kb is not None else None,
-            "used_pct": int(pct_str) if pct_str.isdigit() else None,
-        }
-
-    pkg_raw = sections.get("PKGS", "").strip()
-    package_count = int(pkg_raw) if pkg_raw.isdigit() else None
-
-    services = [s.strip() for s in sections.get("SERVICES", "").splitlines() if s.strip()]
-
-    ports_set: set[int] = set()
-    for line in sections.get("PORTS", "").splitlines():
-        p = _parse_port(line)
-        if p is not None:
-            ports_set.add(p)
-    listening_ports = sorted(ports_set)
-
-    containers: list[dict[str, str]] = []
-    for line in sections.get("CONTAINERS", "").splitlines():
-        if "|" in line:
-            cname, cimage = line.split("|", 1)
-            containers.append({"name": cname.strip(), "image": cimage.strip()})
-
-    reboot_raw = sections.get("REBOOT", "").strip().lower()
-    reboot_required = True if reboot_raw == "yes" else (False if reboot_raw == "no" else None)
-
-    sudo_raw = sections.get("SUDO", "").strip().lower()
-    passwordless_sudo = True if sudo_raw == "yes" else (False if sudo_raw == "no" else None)
-
-    logged_in_users = [u.strip() for u in sections.get("USERS", "").splitlines() if u.strip()]
-    cpu_model = sections.get("CPU", "").strip() or None
-    hostname = sections.get("HOSTNAME", "").strip() or None
-
-    return {
-        "ssh_user": user,
-        "ssh_host": host,
-        "ssh_port": port,
-        "os_id": os_rel.get("ID"),
-        "os_version": os_rel.get("VERSION_ID"),
-        "os_pretty_name": os_rel.get("PRETTY_NAME") or os_rel.get("NAME"),
-        "os_id_like": os_rel.get("ID_LIKE"),
-        "kernel": kernel,
-        "architecture": arch,
-        "hostname": hostname,
-        "uptime_seconds": uptime_seconds,
-        "load_avg": load_avg,
-        "cpu_model": cpu_model,
-        "mem_total_mib": mem_info.get("MemTotal"),
-        "mem_available_mib": mem_info.get("MemAvailable"),
-        "swap_total_mib": mem_info.get("SwapTotal"),
-        "root_disk": root_disk,
-        "package_count": package_count,
-        "running_services": services,
-        "listening_ports": listening_ports,
-        "listening_port_count": len(listening_ports),
-        "containers": containers,
-        "container_count": len(containers),
-        "reboot_required": reboot_required,
-        "passwordless_sudo": passwordless_sudo,
-        "logged_in_users": logged_in_users,
-    }
+    valid_hint = distro_user if distro_user and (allow_any_hint or distro_user in users) else None
+    return _dedup_nonempty((last_known_user, ami_known_user, valid_hint, *users))
 
 
 class SshCollector:
@@ -323,97 +147,67 @@ class SshCollector:
 
     name = "ssh"
 
-    def __init__(
-        self,
-        *,
-        users: Sequence[str] = DEFAULT_SSH_USERS,
-        key_files: Sequence[str | Path] = (),
-        key_dir: str | Path | None = None,
-        port: int = 22,
-        connect_timeout: float = 5.0,
-        command_timeout: float = 15.0,
-        concurrency: int = 32,
-        prefer_public_ip: bool = False,
-        only_unaccessed: bool = False,
-        connect_fn: Callable = asyncssh.connect,
-    ):
-        self.users = tuple(users) if users else DEFAULT_SSH_USERS
-        self.key_files = tuple(key_files)
-        self.key_dir = key_dir
-        self.port = port
-        self.connect_timeout = connect_timeout
-        self.command_timeout = command_timeout
-        self.concurrency = max(1, concurrency)
-        self.prefer_public_ip = prefer_public_ip
-        self.only_unaccessed = only_unaccessed
-        self.connect_fn = connect_fn
+    def __init__(self, **opts: Any) -> None:
+        self.users = tuple(opts.get("users") or DEFAULT_SSH_USERS)
+        self.key_files = tuple(opts.get("key_files") or ())
+        self.key_dir: str | Path | None = opts.get("key_dir")
+        self.port: int = opts.get("port", 22)
+        self.connect_timeout: float = opts.get("connect_timeout", 5.0)
+        self.command_timeout: float = opts.get("command_timeout", 15.0)
+        self.concurrency: int = max(1, opts.get("concurrency", 32))
+        self.prefer_public_ip: bool = bool(opts.get("prefer_public_ip", False))
+        self.only_unaccessed: bool = bool(opts.get("only_unaccessed", False))
+        self.connect_fn: Callable[..., Any] = opts.get("connect_fn", asyncssh.connect)
         self._file_exists_cache: dict[str, bool] = {}
         self._dir_files_cache: dict[str, list[str]] = {}
         self._parsed_key_cache: dict[str, asyncssh.SSHKey | str] = {}
 
     def _is_file_cached(self, p: Path) -> tuple[str, bool]:
-        resolved = str(p.expanduser())
-        exists = self._file_exists_cache.get(resolved)
-        if exists is None:
-            exists = p.expanduser().is_file()
-            self._file_exists_cache[resolved] = exists
-        return resolved, exists
+        exp = p.expanduser()
+        resolved = str(exp)
+        if resolved not in self._file_exists_cache:
+            self._file_exists_cache[resolved] = exp.is_file()
+        return resolved, self._file_exists_cache[resolved]
 
     def _dir_keys_cached(self, key_dir: str | Path) -> list[str]:
         base = Path(key_dir).expanduser()
         key = str(base)
-        cached = self._dir_files_cache.get(key)
-        if cached is not None:
-            return cached
-        files: list[str] = []
-        if base.is_dir():
-            for child in sorted(base.iterdir()):
-                if child.is_file() and not child.name.endswith(".pub"):
-                    resolved = str(child)
-                    self._file_exists_cache[resolved] = True
-                    files.append(resolved)
-        self._dir_files_cache[key] = files
-        return files
+        if key not in self._dir_files_cache:
+            children = sorted(base.iterdir()) if base.is_dir() else []
+            files = [str(c) for c in children if c.is_file() and not c.name.endswith(".pub")]
+            for f in files:
+                self._file_exists_cache[f] = True
+            self._dir_files_cache[key] = files
+        return self._dir_files_cache[key]
 
     def _load_key_cached(self, path: str) -> asyncssh.SSHKey | str:
-        cached = self._parsed_key_cache.get(path)
-        if cached is not None:
-            return cached
-        try:
-            loaded: asyncssh.SSHKey | str = asyncssh.read_private_key(path)
-        except (asyncssh.KeyImportError, OSError):
-            loaded = path
-        self._parsed_key_cache[path] = loaded
-        return loaded
+        if path not in self._parsed_key_cache:
+            try:
+                self._parsed_key_cache[path] = asyncssh.read_private_key(path)
+            except (asyncssh.KeyImportError, OSError):
+                self._parsed_key_cache[path] = path
+        return self._parsed_key_cache[path]
+
+    def _candidate_key_paths(self, inst: InstanceRecord) -> list[Path]:
+        paths: list[Path] = []
+        if self.key_dir and inst.key_name:
+            base = Path(self.key_dir).expanduser()
+            paths.extend((base / inst.key_name, base / f"{inst.key_name}.pem"))
+        paths.extend(Path(kf) for kf in self.key_files)
+        if self.key_dir:
+            paths.extend(Path(p) for p in self._dir_keys_cached(self.key_dir))
+        ssh_dir = Path.home() / ".ssh"
+        paths.extend(ssh_dir / name for name in DEFAULT_KEY_NAMES)
+        return paths
 
     def _resolve_cached_client_keys(self, inst: InstanceRecord) -> Sequence[asyncssh.SSHKey | str]:
         found: list[str] = []
         seen: set[str] = set()
-
-        def _add_path(p: Path) -> None:
+        for p in self._candidate_key_paths(inst):
             resolved, exists = self._is_file_cached(p)
             if exists and resolved not in seen:
                 seen.add(resolved)
                 found.append(resolved)
-
-        if self.key_dir and inst.key_name:
-            base = Path(self.key_dir).expanduser()
-            for candidate in (base / inst.key_name, base / f"{inst.key_name}.pem"):
-                _add_path(candidate)
-
-        for kf in self.key_files:
-            _add_path(Path(kf))
-
-        if self.key_dir:
-            for resolved in self._dir_keys_cached(self.key_dir):
-                if resolved not in seen:
-                    seen.add(resolved)
-                    found.append(resolved)
-
-        ssh_dir = Path.home() / ".ssh"
-        for name in DEFAULT_KEY_NAMES:
-            _add_path(ssh_dir / name)
-
         if self.connect_fn is asyncssh.connect:
             return [self._load_key_cached(p) for p in found]
         return found
@@ -424,9 +218,65 @@ class SshCollector:
         if (inst.platform or "").lower() == "windows":
             return None, EnrichmentResult(status="skipped", error="windows platform skipped")
         host = resolve_target_host(inst, prefer_public_ip=self.prefer_public_ip)
-        if not host:
-            return None, EnrichmentResult(status="skipped", error="no reachable IP or DNS name")
-        return host, None
+        return (
+            (host, None)
+            if host
+            else (None, EnrichmentResult(status="skipped", error="no reachable IP or DNS name"))
+        )
+
+    def _connect_kwargs(
+        self, host: str, user: str, client_keys: Sequence[asyncssh.SSHKey | str]
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "host": host,
+            "port": self.port,
+            "username": user,
+            "known_hosts": None,
+            "preferred_auth": "publickey",
+            "connect_timeout": self.connect_timeout,
+            "login_timeout": self.connect_timeout,
+        }
+        if client_keys:
+            kwargs["client_keys"] = client_keys
+        return kwargs
+
+    async def _attempt_user(
+        self,
+        host: str,
+        user: str,
+        client_keys: Sequence[asyncssh.SSHKey | str],
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        try:
+            async with self.connect_fn(**self._connect_kwargs(host, user, client_keys)) as conn:
+                res = await asyncio.wait_for(
+                    conn.run(PROBE_SCRIPT, check=False), timeout=self.command_timeout
+                )
+                return parse_probe_output(str(res.stdout or ""), user, host, self.port), None
+        except asyncssh.PermissionDenied:
+            return None, None
+        except (TimeoutError, OSError, asyncssh.DisconnectError, asyncssh.Error) as exc:
+            if isinstance(exc, asyncssh.Error) and "auth" in str(exc).lower():
+                return None, None
+            return None, f"{host}:{self.port} ({user}): {type(exc).__name__}: {exc}"
+
+    async def _probe_candidates(
+        self,
+        host: str,
+        candidates: list[str],
+        client_keys: Sequence[asyncssh.SSHKey | str],
+        on_success: Callable[[str], None] | None = None,
+    ) -> EnrichmentResult:
+        for idx, user in enumerate(candidates):
+            facts, fatal_err = await self._attempt_user(host, user, client_keys)
+            if facts is not None:
+                facts["attempted_users"] = candidates[: idx + 1]
+                if on_success:
+                    on_success(user)
+                return EnrichmentResult(status="succeeded", facts=facts)
+            if fatal_err is not None:
+                return EnrichmentResult(status="failed", error=fatal_err)
+        err = f"authentication failed for users {list(candidates)} on {host}:{self.port}"
+        return EnrichmentResult(status="failed", error=err)
 
     async def _probe_instance(
         self,
@@ -437,11 +287,11 @@ class SshCollector:
         learned_ami_users: dict[str, str] | None = None,
     ) -> EnrichmentResult:
         host, skip_res = self._check_skippable(inst)
-        if skip_res is not None or host is None:
-            return skip_res or EnrichmentResult(status="skipped", error="no reachable IP")
-
+        if skip_res is not None:
+            return skip_res
+        assert host is not None  # noqa: S101
         effective_ami_user = ami_known_user or (
-            learned_ami_users.get(inst.image_id) if learned_ami_users and inst.image_id else None
+            learned_ami_users.get(inst.image_id) if learned_ami_users else None
         )
         client_keys = self._resolve_cached_client_keys(inst)
         candidates = ordered_candidate_users(
@@ -452,63 +302,24 @@ class SshCollector:
             ami_known_user=effective_ami_user,
         )
 
-        tried_errors: list[str] = []
-        for user in candidates:
-            try:
-                connect_kwargs: dict[str, Any] = {
-                    "host": host,
-                    "port": self.port,
-                    "username": user,
-                    "known_hosts": None,
-                    "preferred_auth": "publickey",
-                    "connect_timeout": self.connect_timeout,
-                    "login_timeout": self.connect_timeout,
-                }
-                if client_keys:
-                    connect_kwargs["client_keys"] = client_keys
+        def _remember(user: str) -> None:
+            if learned_ami_users is not None and inst.image_id:
+                learned_ami_users.setdefault(inst.image_id, user)
 
-                async with self.connect_fn(**connect_kwargs) as conn:
-                    res = await asyncio.wait_for(
-                        conn.run(PROBE_SCRIPT, check=False),
-                        timeout=self.command_timeout,
-                    )
-                    stdout = res.stdout if isinstance(res.stdout, str) else str(res.stdout or "")
-                    facts = parse_probe_output(stdout, user, host, self.port)
-                    facts["attempted_users"] = candidates[: candidates.index(user) + 1]
-                    if learned_ami_users is not None and inst.image_id:
-                        learned_ami_users.setdefault(inst.image_id, user)
-                    return EnrichmentResult(status="succeeded", facts=facts)
-            except asyncssh.PermissionDenied as exc:
-                tried_errors.append(f"{user}: {exc}")
-                continue
-            except (TimeoutError, OSError, asyncssh.DisconnectError, asyncssh.Error) as exc:
-                # Network/socket failure or non-auth disconnect: abort further username retries
-                if isinstance(exc, asyncssh.Error) and "auth" in str(exc).lower():
-                    tried_errors.append(f"{user}: {exc}")
-                    continue
-                return EnrichmentResult(
-                    status="failed",
-                    error=f"{host}:{self.port} ({user}): {type(exc).__name__}: {exc}",
-                )
-
-        return EnrichmentResult(
-            status="failed",
-            error=f"authentication failed for users {list(candidates)} on {host}:{self.port}",
-        )
+        return await self._probe_candidates(host, candidates, client_keys, _remember)
 
     async def enrich_many_async(
         self,
-        aws_account_id: str,
-        region: str,
+        _aws_account_id: str,
+        _region: str,
         instances: Sequence[InstanceRecord],
         ami_names: dict[str, str | None] | None = None,
-        known_users: dict[str, str] | None = None,
-        known_ami_users: dict[str, str] | None = None,
+        **user_hints: dict[str, str] | None,
     ) -> dict[str, EnrichmentResult]:
         sem = asyncio.Semaphore(self.concurrency)
         ami_names = ami_names or {}
-        known_users = known_users or {}
-        learned_ami_users: dict[str, str] = dict(known_ami_users or {})
+        known_users = user_hints.get("known_users") or {}
+        learned_ami_users: dict[str, str] = dict(user_hints.get("known_ami_users") or {})
 
         async def _guarded(inst: InstanceRecord) -> tuple[str, EnrichmentResult]:
             _, skip_res = self._check_skippable(inst)
@@ -532,13 +343,10 @@ class SshCollector:
         region: str,
         instances: Sequence[InstanceRecord],
         ami_names: dict[str, str | None] | None = None,
-        known_users: dict[str, str] | None = None,
-        known_ami_users: dict[str, str] | None = None,
+        **user_hints: dict[str, str] | None,
     ) -> dict[str, EnrichmentResult]:
         return asyncio.run(
-            self.enrich_many_async(
-                aws_account_id, region, instances, ami_names, known_users, known_ami_users
-            )
+            self.enrich_many_async(aws_account_id, region, instances, ami_names, **user_hints)
         )
 
     def enrich(
@@ -548,4 +356,5 @@ class SshCollector:
         instance: InstanceRecord,
         last_known_user: str | None = None,
     ) -> EnrichmentResult:
+        del aws_account_id, region
         return asyncio.run(self._probe_instance(instance, last_known_user=last_known_user))

@@ -31,29 +31,31 @@ def _enum(*values: str) -> sa.Enum:
 
 
 VIEW_NAME = "v_instance_analytics"
-CREATE_VIEW_MYSQL_SQL = f"""
-CREATE OR REPLACE VIEW {VIEW_NAME} AS
-SELECT
-    i.*,
-    TIMESTAMPDIFF(DAY, i.launch_time, i.last_seen_at) AS instance_age_days,
-    TIMESTAMPDIFF(DAY, i.ami_creation_date, i.last_seen_at) AS ami_age_days,
-    (i.public_ip IS NOT NULL) AS has_public_ip,
-    (i.imds_http_tokens = 'required') AS is_imdsv2_enforced,
-    (i.ssh_status = 'succeeded') AS is_ssh_accessible
-FROM instance i
-"""
+CREATE_VIEW_MYSQL_SQL = (
+    "CREATE OR REPLACE VIEW v_instance_analytics AS\n"
+    "SELECT\n"
+    "    i.*,\n"
+    "    TIMESTAMPDIFF(DAY, i.launch_time, i.last_seen_at) AS instance_age_days,\n"
+    "    TIMESTAMPDIFF(DAY, i.ami_creation_date, i.last_seen_at) AS ami_age_days,\n"
+    "    (i.public_ip IS NOT NULL) AS has_public_ip,\n"
+    "    (i.imds_http_tokens = 'required') AS is_imdsv2_enforced,\n"
+    "    (i.ssh_status = 'succeeded') AS is_ssh_accessible\n"
+    "FROM instance i"
+)
 
-CREATE_VIEW_SQLITE_SQL = f"""
-CREATE VIEW IF NOT EXISTS {VIEW_NAME} AS
-SELECT
-    i.*,
-    CAST(julianday(i.last_seen_at) - julianday(i.launch_time) AS INTEGER) AS instance_age_days,
-    CAST(julianday(i.last_seen_at) - julianday(i.ami_creation_date) AS INTEGER) AS ami_age_days,
-    (i.public_ip IS NOT NULL) AS has_public_ip,
-    (i.imds_http_tokens = 'required') AS is_imdsv2_enforced,
-    (i.ssh_status = 'succeeded') AS is_ssh_accessible
-FROM instance i
-"""
+CREATE_VIEW_SQLITE_SQL = (
+    "CREATE VIEW IF NOT EXISTS v_instance_analytics AS\n"
+    "SELECT\n"
+    "    i.*,\n"
+    "    CAST(julianday(i.last_seen_at) - julianday(i.launch_time) AS INTEGER)"
+    " AS instance_age_days,\n"
+    "    CAST(julianday(i.last_seen_at) - julianday(i.ami_creation_date) AS INTEGER)"
+    " AS ami_age_days,\n"
+    "    (i.public_ip IS NOT NULL) AS has_public_ip,\n"
+    "    (i.imds_http_tokens = 'required') AS is_imdsv2_enforced,\n"
+    "    (i.ssh_status = 'succeeded') AS is_ssh_accessible\n"
+    "FROM instance i"
+)
 
 
 def upgrade() -> None:

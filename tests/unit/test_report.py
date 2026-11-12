@@ -1,24 +1,34 @@
 """Unit tests for inventory summary and CSV export (`ec2_scraping.report` and CLI commands)."""
 
+from __future__ import annotations
+
 import csv
 import io
 import json
 from datetime import datetime
+from typing import TYPE_CHECKING
+
+from tests.integration.helpers import make_ssh_enrichment
 
 from ec2_scraping import cli, load, report
 from ec2_scraping.db import connect
 from ec2_scraping.models import (
     AmiRecord,
     Collected,
-    EnrichmentResult,
     InstanceRecord,
     TypeInfo,
     VolumeAttachment,
     VolumeInfo,
 )
 
+if TYPE_CHECKING:
+    from pathlib import Path
 
-def _seed_db(session):
+    import pytest
+    from sqlalchemy.orm import Session
+
+
+def _seed_db(session: Session) -> None:
     inst_1 = InstanceRecord(
         instance_id="i-1",
         instance_type="t3.micro",
@@ -67,21 +77,7 @@ def _seed_db(session):
             "vol-2": VolumeInfo("vol-2", 100, "gp3", False),
         },
     )
-    enrichments = {
-        "i-1": {
-            "ssh": EnrichmentResult(
-                status="succeeded",
-                facts={
-                    "ssh_user": "ubuntu",
-                    "ssh_host": "10.0.0.1",
-                    "ssh_port": 22,
-                    "os_id": "ubuntu",
-                    "os_version": "24.04",
-                    "os_pretty_name": "Ubuntu 24.04 LTS",
-                },
-            )
-        }
-    }
+    enrichments = {"i-1": {"ssh": make_ssh_enrichment()}}
     load.load_instances(session, "111111111111", "us-east-1", data_east, enrichments)
 
     inst_3 = InstanceRecord(
@@ -102,91 +98,97 @@ def _seed_db(session):
     session.commit()
 
 
-def test_summarize_instances_and_formatting(tmp_path):
+def _assert_summary_counts(s: report.InventorySummary) -> None:
+    assert (
+        s.total_instances,
+        s.total_vcpu,
+        s.total_memory_mib,
+        s.total_ebs_volumes,
+        s.total_ebs_size_gib,
+    ) == (3, 6, 11264, 2, 120)
+    assert (s.by_state, s.by_account, s.by_region, s.by_instance_family) == (
+        {"running": 2, "stopped": 1},
+        {"111111111111": 2, "222222222222": 1},
+        {"us-east-1": 2, "us-west-2": 1},
+        {"t3": 2, "m5": 1},
+    )
+    assert (s.by_instance_type, s.by_ssh_status, s.by_os, s.by_ami) == (
+        {"m5.large": 1, "t3.micro": 1, "t3.small": 1},
+        {"not-probed": 2, "succeeded": 1},
+        {"Ubuntu 24.04 LTS": 1, "Windows": 1, "unknown": 1},
+        {"ami-1": 1, "ami-1 (ubuntu-24.04)": 1, "ami-2": 1},
+    )
+
+
+def _assert_formatted_text(text: str) -> None:
+    expected_snippets = (
+        "Total instances: 3",
+        "vCPUs: 6",
+        "Memory: 11.0 GiB (11264 MiB)",
+        "EBS: 2 volumes, 120 GiB",
+        "By state:\n  running: 2\n  stopped: 1",
+        "By OS / platform:\n  Ubuntu 24.04 LTS: 1",
+    )
+    assert all(snippet in text for snippet in expected_snippets)
+
+
+def test_summarize_instances_and_formatting(tmp_path: Path) -> None:
     dsn = f"sqlite:///{tmp_path / 'inv.db'}"
     session = connect(dsn)
     try:
         _seed_db(session)
         s = report.summarize_instances(session)
-        assert s.total_instances == 3
-        assert s.total_vcpu == 6
-        assert s.total_memory_mib == 11264
-        assert s.total_ebs_volumes == 2
-        assert s.total_ebs_size_gib == 120
-        assert s.by_state == {"running": 2, "stopped": 1}
-        assert s.by_account == {"111111111111": 2, "222222222222": 1}
-        assert s.by_region == {"us-east-1": 2, "us-west-2": 1}
-        assert s.by_instance_family == {"t3": 2, "m5": 1}
-        assert s.by_instance_type == {"m5.large": 1, "t3.micro": 1, "t3.small": 1}
-        assert s.by_ssh_status == {"not-probed": 2, "succeeded": 1}
-        assert s.by_os == {"Ubuntu 24.04 LTS": 1, "Windows": 1, "unknown": 1}
-        assert s.by_ami == {"ami-1": 1, "ami-1 (ubuntu-24.04)": 1, "ami-2": 1}
+        _assert_summary_counts(s)
+        _assert_formatted_text(report.format_inventory_summary(s))
 
-        text = report.format_inventory_summary(s)
-        assert "Total instances: 3" in text
-        assert "vCPUs: 6" in text
-        assert "Memory: 11.0 GiB (11264 MiB)" in text
-        assert "EBS: 2 volumes, 120 GiB" in text
-        assert "By state:\n  running: 2\n  stopped: 1" in text
-        assert "By OS / platform:\n  Ubuntu 24.04 LTS: 1" in text
-
-        # Filtered summary
         filtered = report.summarize_instances(
             session, regions=["us-east-1"], accounts=["111111111111"], states=["running"]
         )
-        assert filtered.total_instances == 1
-        assert filtered.by_instance_type == {"t3.micro": 1}
+        assert (filtered.total_instances, filtered.by_instance_type) == (1, {"t3.micro": 1})
     finally:
         session.close()
 
 
-def test_export_instances_csv_and_cli_commands(tmp_path, capsys):
+def _assert_exported_rows(rows: list[dict[str, str]]) -> None:
+    assert [r["instance_id"] for r in rows] == ["i-1", "i-2", "i-3"]
+    assert json.loads(rows[0]["tags"]) == {"Name": "web-1", "env": "prod"}
+    assert (rows[0]["ssh_os_pretty_name"], rows[1]["state"]) == ("Ubuntu 24.04 LTS", "stopped")
+
+
+def test_export_instances_csv_and_cli_commands(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     dsn = f"sqlite:///{tmp_path / 'inv.db'}"
     session = connect(dsn)
     try:
         _seed_db(session)
         buf = io.StringIO()
-        written = report.export_instances_csv(session, buf)
-        assert written == 3
+        assert report.export_instances_csv(session, buf) == 3
     finally:
         session.close()
 
-    rows = list(csv.DictReader(io.StringIO(buf.getvalue())))
-    assert len(rows) == 3
-    assert [r["instance_id"] for r in rows] == ["i-1", "i-2", "i-3"]
-    assert json.loads(rows[0]["tags"]) == {"Name": "web-1", "env": "prod"}
-    assert rows[0]["ssh_os_pretty_name"] == "Ubuntu 24.04 LTS"
-    assert rows[1]["state"] == "stopped"
+    _assert_exported_rows(list(csv.DictReader(io.StringIO(buf.getvalue()))))
 
-    # CLI summary command
-    rc = cli.main(["summary", "--dsn", dsn, "--state", "running"])
-    assert rc == 0
-    out = capsys.readouterr().out
-    assert "Total instances: 2" in out
+    assert cli.main(["summary", "--dsn", dsn, "--state", "running"]) == 0
+    assert "Total instances: 2" in capsys.readouterr().out
 
-    # CLI export to file
     csv_path = tmp_path / "out" / "export.csv"
-    rc = cli.main(
-        [
-            "export",
-            "--dsn",
-            dsn,
-            "--region",
-            "us-east-1",
-            "--account",
-            "111111111111",
-            "-o",
-            str(csv_path),
-        ]
-    )
-    assert rc == 0
+    export_args = [
+        "export",
+        "--dsn",
+        dsn,
+        "--region",
+        "us-east-1",
+        "--account",
+        "111111111111",
+        "-o",
+        str(csv_path),
+    ]
+    assert cli.main(export_args) == 0
     with csv_path.open(encoding="utf-8", newline="") as fh:
-        exported = list(csv.DictReader(fh))
-    assert [r["instance_id"] for r in exported] == ["i-1", "i-2"]
+        assert [r["instance_id"] for r in csv.DictReader(fh)] == ["i-1", "i-2"]
 
-    # CLI export to stdout
     capsys.readouterr()
-    rc = cli.main(["export", "--dsn", dsn, "--region", "us-west-2"])
-    assert rc == 0
+    assert cli.main(["export", "--dsn", dsn, "--region", "us-west-2"]) == 0
     stdout_rows = list(csv.DictReader(io.StringIO(capsys.readouterr().out)))
     assert [r["instance_id"] for r in stdout_rows] == ["i-3"]

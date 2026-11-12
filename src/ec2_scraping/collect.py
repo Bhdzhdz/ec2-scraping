@@ -2,6 +2,7 @@
 
 from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime
+from typing import Any
 
 from botocore.exceptions import ClientError
 
@@ -27,11 +28,11 @@ _TOLERATED = {
 }
 
 
-def _naive_utc(value) -> datetime | None:
+def _naive_utc(value: datetime | str | None) -> datetime | None:
     if value is None:
         return None
     if isinstance(value, str):
-        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        value = datetime.fromisoformat(value)
     if value.tzinfo is not None:
         value = value.astimezone(UTC).replace(tzinfo=None)
     return value.replace(microsecond=0)
@@ -47,8 +48,8 @@ def _batches(values: Iterable[str], size: int = BATCH) -> Iterator[list[str]]:
         yield ordered[i : i + size]
 
 
-def map_instance(raw: dict) -> InstanceRecord:
-    nics = [
+def _map_nics(raw_nics: list[dict]) -> list[NetworkInterfaceRecord]:
+    return [
         NetworkInterfaceRecord(
             eni_id=n["NetworkInterfaceId"],
             subnet_id=n.get("SubnetId"),
@@ -59,32 +60,56 @@ def map_instance(raw: dict) -> InstanceRecord:
                 ip["Ipv6Address"] for ip in n.get("Ipv6Addresses", []) if ip.get("Ipv6Address")
             ],
         )
-        for n in raw.get("NetworkInterfaces", [])
+        for n in raw_nics
     ]
-    volumes = [
+
+
+def _map_volumes(raw_bdms: list[dict]) -> list[VolumeAttachment]:
+    return [
         VolumeAttachment(
             device_name=b["DeviceName"],
             volume_id=b["Ebs"]["VolumeId"],
             delete_on_termination=b["Ebs"].get("DeleteOnTermination"),
         )
-        for b in raw.get("BlockDeviceMappings", [])
+        for b in raw_bdms
         if b.get("Ebs") and b["Ebs"].get("VolumeId")
     ]
-    tags = _tags(raw.get("Tags"))
-    placement = raw.get("Placement") or {}
-    cpu_opts = raw.get("CpuOptions") or {}
-    imds = raw.get("MetadataOptions") or {}
-    state_reason = raw.get("StateReason") or {}
-    monitoring = (raw.get("Monitoring") or {}).get("State", "disabled")
-    launch_time = _naive_utc(raw["LaunchTime"])
-    assert launch_time is not None
 
-    ipv6 = raw.get("Ipv6Address")
-    if not ipv6:
-        for nic in nics:
-            if nic.ipv6_addresses:
-                ipv6 = nic.ipv6_addresses[0]
-                break
+
+def _first_ipv6(raw: dict, nics: list[NetworkInterfaceRecord]) -> str | None:
+    if ipv6 := raw.get("Ipv6Address"):
+        return ipv6
+    for nic in nics:
+        if nic.ipv6_addresses:
+            return nic.ipv6_addresses[0]
+    return None
+
+
+def _opt_str(value: str | None, default: str | None = None) -> str | None:
+    return value or default
+
+
+def _sub_get(raw: dict, key: str, subkey: str, default: Any = None) -> Any:
+    sub = raw.get(key)
+    return sub.get(subkey, default) if sub else default
+
+
+def _monitoring_state(raw: dict) -> str:
+    state = _sub_get(raw, "Monitoring", "State", "disabled")
+    return state if state in ("disabled", "enabled", "pending") else "disabled"
+
+
+def map_instance(raw: dict) -> InstanceRecord:
+    nics = _map_nics(raw.get("NetworkInterfaces", []))
+    volumes = _map_volumes(raw.get("BlockDeviceMappings", []))
+    tags = _tags(raw.get("Tags"))
+    placement = raw["Placement"]
+    cpu_opts = raw.get("CpuOptions", {})
+    imds = raw.get("MetadataOptions", {})
+    launch_time = _naive_utc(raw["LaunchTime"])
+    if launch_time is None:
+        msg = "LaunchTime is required"
+        raise ValueError(msg)
 
     return InstanceRecord(
         instance_id=raw["InstanceId"],
@@ -95,16 +120,16 @@ def map_instance(raw: dict) -> InstanceRecord:
         architecture=raw.get("Architecture", "unknown"),
         launch_time=launch_time,
         name=tags.get("Name"),
-        state_reason_code=state_reason.get("Code"),
-        state_transition_reason=raw.get("StateTransitionReason") or None,
-        lifecycle=raw.get("InstanceLifecycle") or "on-demand",
+        state_reason_code=_sub_get(raw, "StateReason", "Code"),
+        state_transition_reason=_opt_str(raw.get("StateTransitionReason")),
+        lifecycle=_opt_str(raw.get("InstanceLifecycle"), "on-demand") or "on-demand",
         spot_instance_request_id=raw.get("SpotInstanceRequestId"),
         capacity_reservation_id=raw.get("CapacityReservationId"),
-        tenancy=placement.get("Tenancy") or "default",
-        placement_group=placement.get("GroupName") or None,
+        tenancy=_opt_str(placement.get("Tenancy"), "default") or "default",
+        placement_group=_opt_str(placement.get("GroupName")),
         host_id=placement.get("HostId"),
         usage_operation=raw.get("UsageOperation"),
-        monitoring=monitoring if monitoring in ("disabled", "enabled", "pending") else "disabled",
+        monitoring=_monitoring_state(raw),
         cpu_core_count=cpu_opts.get("CoreCount"),
         cpu_threads_per_core=cpu_opts.get("ThreadsPerCore"),
         hypervisor=raw.get("Hypervisor"),
@@ -119,15 +144,15 @@ def map_instance(raw: dict) -> InstanceRecord:
         subnet_id=raw.get("SubnetId"),
         private_ip=raw.get("PrivateIpAddress"),
         public_ip=raw.get("PublicIpAddress"),
-        ipv6_address=ipv6,
-        private_dns_name=raw.get("PrivateDnsName") or None,
-        public_dns_name=raw.get("PublicDnsName") or None,
+        ipv6_address=_first_ipv6(raw, nics),
+        private_dns_name=_opt_str(raw.get("PrivateDnsName")),
+        public_dns_name=_opt_str(raw.get("PublicDnsName")),
         source_dest_check=raw.get("SourceDestCheck"),
         ebs_optimized=bool(raw.get("EbsOptimized", False)),
         root_device_type=raw.get("RootDeviceType"),
         root_device_name=raw.get("RootDeviceName"),
         key_name=raw.get("KeyName"),
-        iam_profile_arn=(raw.get("IamInstanceProfile") or {}).get("Arn"),
+        iam_profile_arn=_sub_get(raw, "IamInstanceProfile", "Arn"),
         imds_http_tokens=imds.get("HttpTokens"),
         imds_http_endpoint=imds.get("HttpEndpoint"),
         imds_hop_limit=imds.get("HttpPutResponseHopLimit"),
@@ -157,17 +182,23 @@ def map_ami(raw: dict) -> AmiRecord:
     )
 
 
-def map_type_info(raw: dict) -> TypeInfo:
-    archs = (raw.get("ProcessorInfo") or {}).get("SupportedArchitectures") or [None]
-    gpus = (raw.get("GpuInfo") or {}).get("Gpus") or []
+def _gpu_summary(gpu_info: dict | None) -> tuple[int | None, str | None, int | None]:
+    if not gpu_info:
+        return None, None, None
+    gpus = gpu_info.get("Gpus") or []
     gpu_count = sum(g.get("Count", 0) for g in gpus) if gpus else None
-    gpu_models = [
+    models = [
         f"{g.get('Manufacturer', '')} {g.get('Name', '')}".strip()
         for g in gpus
         if g.get("Manufacturer") or g.get("Name")
     ]
-    gpu_model = ", ".join(dict.fromkeys(gpu_models)) if gpu_models else None
-    gpu_mem = (raw.get("GpuInfo") or {}).get("TotalGpuMemoryInMiB")
+    gpu_model = ", ".join(dict.fromkeys(models)) if models else None
+    return gpu_count, gpu_model, gpu_info.get("TotalGpuMemoryInMiB")
+
+
+def map_type_info(raw: dict) -> TypeInfo:
+    archs = (raw.get("ProcessorInfo") or {}).get("SupportedArchitectures") or [None]
+    gpu_count, gpu_model, gpu_mem = _gpu_summary(raw.get("GpuInfo"))
     storage_gib = (raw.get("InstanceStorageInfo") or {}).get("TotalSizeInGB")
     return TypeInfo(
         vcpu=(raw.get("VCpuInfo") or {}).get("DefaultVCpus"),
@@ -200,23 +231,19 @@ def _error_code(exc: ClientError) -> str | None:
 
 
 def _fetch_batch(
-    ec2,
+    ec2: Any,
     operation: str,
     param_name: str,
     result_key: str,
     items: list[str],
-    *,
-    use_paginator: bool = True,
 ) -> list[dict]:
     """Describe a batch of resource IDs; fall back to single-item calls on tolerated errors."""
 
     def _call(ids: list[str]) -> list[dict]:
-        if use_paginator:
-            out: list[dict] = []
-            for page in ec2.get_paginator(operation).paginate(**{param_name: ids}):
-                out.extend(page.get(result_key, []))
-            return out
-        return getattr(ec2, operation)(**{param_name: ids}).get(result_key, [])
+        out: list[dict] = []
+        for page in ec2.get_paginator(operation).paginate(**{param_name: ids}):
+            out.extend(page.get(result_key, []))
+        return out
 
     try:
         return _call(items)
@@ -233,45 +260,87 @@ def _fetch_batch(
     return found
 
 
-def _fetch_images(ec2, image_ids: list[str]) -> list[dict]:
+def _fetch_images(ec2: Any, image_ids: list[str]) -> list[dict]:
     """Describe referenced AMIs; tolerate ones that are missing or not visible."""
-    return _fetch_batch(
-        ec2, "describe_images", "ImageIds", "Images", image_ids, use_paginator=False
-    )
+    try:
+        return ec2.describe_images(ImageIds=image_ids).get("Images", [])
+    except ClientError as exc:
+        if _error_code(exc) not in _TOLERATED:
+            raise
+    found: list[dict] = []
+    for image_id in image_ids:
+        try:
+            found.extend(ec2.describe_images(ImageIds=[image_id]).get("Images", []))
+        except ClientError as exc:
+            if _error_code(exc) not in _TOLERATED:
+                raise
+    return found
 
 
-def collect(ec2, account_id: str) -> Collected:
-    """Gather instances and the reference/AMI/volume metadata needed to load them."""
-    data = Collected()
+def _collect_all_batches(
+    ec2: Any,
+    operation: str,
+    param_name: str,
+    result_key: str,
+    ids: Iterable[str],
+) -> Iterator[dict]:
+    for batch in _batches(ids):
+        yield from _fetch_batch(ec2, operation, param_name, result_key, batch)
 
+
+def _collect_instances(ec2: Any) -> list[InstanceRecord]:
+    instances: list[InstanceRecord] = []
     for page in ec2.get_paginator("describe_instances").paginate():
         for reservation in page["Reservations"]:
-            data.instances.extend(map_instance(i) for i in reservation["Instances"])
+            instances.extend(map_instance(i) for i in reservation["Instances"])
+    return instances
 
-    referenced = {i.image_id for i in data.instances}
-    for batch in _batches(referenced):
-        for raw in _fetch_images(ec2, batch):
-            data.amis[raw["ImageId"]] = map_ami(raw)
 
-    for batch in _batches(i.instance_type for i in data.instances):
-        for t in _fetch_batch(
-            ec2, "describe_instance_types", "InstanceTypes", "InstanceTypes", batch
-        ):
-            data.type_info[t["InstanceType"]] = map_type_info(t)
+def _collect_amis(ec2: Any, instances: list[InstanceRecord]) -> dict[str, AmiRecord]:
+    return {
+        raw["ImageId"]: map_ami(raw)
+        for batch in _batches(i.image_id for i in instances)
+        for raw in _fetch_images(ec2, batch)
+    }
 
-    volume_ids = {v.volume_id for i in data.instances for v in i.volumes}
-    for batch in _batches(volume_ids):
-        for v in _fetch_batch(ec2, "describe_volumes", "VolumeIds", "Volumes", batch):
-            data.volume_info[v["VolumeId"]] = map_volume(v)
 
-    vpc_ids = {i.vpc_id for i in data.instances if i.vpc_id}
-    for batch in _batches(vpc_ids):
-        for v in _fetch_batch(ec2, "describe_vpcs", "VpcIds", "Vpcs", batch):
-            data.vpc_cidrs[v["VpcId"]] = v["CidrBlock"]
+def _collect_vpc_cidrs(ec2: Any, ids: list[str]) -> dict[str, str]:
+    return {
+        v["VpcId"]: v["CidrBlock"]
+        for v in _collect_all_batches(ec2, "describe_vpcs", "VpcIds", "Vpcs", ids)
+    }
 
-    subnet_ids = {i.subnet_id for i in data.instances if i.subnet_id}
-    for batch in _batches(subnet_ids):
-        for s in _fetch_batch(ec2, "describe_subnets", "SubnetIds", "Subnets", batch):
-            data.subnet_cidrs[s["SubnetId"]] = s["CidrBlock"]
 
-    return data
+def _collect_subnet_cidrs(ec2: Any, ids: list[str]) -> dict[str, str]:
+    return {
+        s["SubnetId"]: s["CidrBlock"]
+        for s in _collect_all_batches(ec2, "describe_subnets", "SubnetIds", "Subnets", ids)
+    }
+
+
+def collect(ec2: Any, _account_id: str = "") -> Collected:
+    """Gather instances and the reference/AMI/volume metadata needed to load them."""
+    instances = _collect_instances(ec2)
+    amis = _collect_amis(ec2, instances)
+    type_ids = [i.instance_type for i in instances]
+    vol_ids = [v.volume_id for i in instances for v in i.volumes]
+    vpc_ids = [i.vpc_id for i in instances if i.vpc_id]
+    sub_ids = [i.subnet_id for i in instances if i.subnet_id]
+    type_info = {
+        t["InstanceType"]: map_type_info(t)
+        for t in _collect_all_batches(
+            ec2, "describe_instance_types", "InstanceTypes", "InstanceTypes", type_ids
+        )
+    }
+    volume_info = {
+        v["VolumeId"]: map_volume(v)
+        for v in _collect_all_batches(ec2, "describe_volumes", "VolumeIds", "Volumes", vol_ids)
+    }
+    return Collected(
+        instances=instances,
+        amis=amis,
+        type_info=type_info,
+        volume_info=volume_info,
+        vpc_cidrs=_collect_vpc_cidrs(ec2, vpc_ids),
+        subnet_cidrs=_collect_subnet_cidrs(ec2, sub_ids),
+    )

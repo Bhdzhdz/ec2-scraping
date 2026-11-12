@@ -1,13 +1,16 @@
 """Shared builders and fakes for integration tests."""
 
+from __future__ import annotations
+
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from botocore.exceptions import ClientError
 
 from ec2_scraping.models import (
     AmiRecord,
     Collected,
+    EnrichmentResult,
     InstanceRecord,
     NetworkInterfaceRecord,
     TypeInfo,
@@ -16,8 +19,30 @@ from ec2_scraping.models import (
 )
 from ec2_scraping.session import SsoLoginRequired
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
-def make_instance(instance_id: str = "i-1", **kw) -> InstanceRecord:
+
+def make_ssh_enrichment(
+    user: str = "ubuntu",
+    host: str = "10.0.0.1",
+    port: int = 22,
+    **extra_facts: Any,
+) -> EnrichmentResult:
+    facts: dict[str, Any] = {
+        "ssh_user": user,
+        "ssh_host": host,
+        "ssh_port": port,
+        "os_id": "ubuntu",
+        "os_version": "24.04",
+        "os_pretty_name": "Ubuntu 24.04 LTS",
+        "kernel": "6.8.0",
+        **extra_facts,
+    }
+    return EnrichmentResult(status="succeeded", facts=facts)
+
+
+def make_instance(instance_id: str = "i-1", **kw: Any) -> InstanceRecord:
     base: dict[str, Any] = {
         "instance_id": instance_id,
         "name": "web",
@@ -47,7 +72,7 @@ def make_instance(instance_id: str = "i-1", **kw) -> InstanceRecord:
     return InstanceRecord(**base)
 
 
-def make_ami(image_id: str = "ami-1", **kw) -> AmiRecord:
+def make_ami(image_id: str = "ami-1", **kw: Any) -> AmiRecord:
     base: dict[str, Any] = {
         "image_id": image_id,
         "owner_aws_account_id": "111111111111",
@@ -75,7 +100,7 @@ def collected(*instances: InstanceRecord, amis: tuple[AmiRecord, ...] = ()) -> C
 class FakeSession:
     default_region = "us-east-1"
 
-    def __init__(self, profile: str, account_id: str):
+    def __init__(self, profile: str, account_id: str) -> None:
         self.profile = profile
         self.account_id = account_id
 
@@ -83,7 +108,7 @@ class FakeSession:
         return region  # the fake collector receives the region as its "client"
 
 
-def opener(accounts: dict[str, str | Exception]):
+def opener(accounts: dict[str, str | Exception]) -> Callable[[str], FakeSession]:
     """open_session replacement: profile -> FakeSession, or raise the configured error."""
 
     def open_session(profile: str) -> FakeSession:
@@ -103,7 +128,7 @@ def client_error(code: str) -> ClientError:
     return ClientError({"Error": {"Code": code, "Message": "boom"}}, "DescribeInstances")
 
 
-def scripted_collector(script: dict):
+def scripted_collector(script: dict) -> Callable[[str, str], Collected]:
     """collect_fn(region, account_id): script[(account_id, region)] is Collected or an exception."""
 
     def collect_fn(region: str, account_id: str) -> Collected:

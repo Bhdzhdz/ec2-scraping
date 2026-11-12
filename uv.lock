@@ -594,6 +594,7 @@ dependencies = [
     { name = "alembic" },
     { name = "asyncssh" },
     { name = "boto3" },
+    { name = "botocore" },
     { name = "pymysql" },
     { name = "sqlalchemy" },
 ]
@@ -619,6 +620,7 @@ requires-dist = [
     { name = "alembic", specifier = ">=1.13" },
     { name = "asyncssh", specifier = ">=2.14" },
     { name = "boto3", specifier = ">=1.43.114" },
+    { name = "botocore", specifier = ">=1.35.0" },
     { name = "pymysql", specifier = ">=1.2.3" },
     { name = "sqlalchemy", specifier = ">=2.0" },
 ]

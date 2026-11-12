@@ -1,9 +1,11 @@
 """Unit tests for the async SSH collector: user rotation, key resolution, and probe parsing."""
 
+from __future__ import annotations
+
 from contextlib import asynccontextmanager
 from datetime import datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 import asyncssh
@@ -12,6 +14,10 @@ import pytest
 from ec2_scraping import cli, load, runner, ssh
 from ec2_scraping.db.models import Instance
 from ec2_scraping.models import Collected, InstanceRecord
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+    from pathlib import Path
 
 SAMPLE_PROBE_OUTPUT = """===SECTION:OS_RELEASE===
 NAME="Ubuntu"
@@ -57,8 +63,51 @@ yes
 ===SECTION:END===
 """
 
+_EXPECTED_PARSED_FACTS: dict[str, Any] = {
+    "ssh_user": "ubuntu",
+    "ssh_host": "10.0.0.1",
+    "ssh_port": 22,
+    "os_id": "ubuntu",
+    "os_version": "24.04",
+    "os_pretty_name": "Ubuntu 24.04.1 LTS",
+    "os_id_like": "debian",
+    "kernel": "6.8.0-1015-aws",
+    "architecture": "x86_64",
+    "hostname": "ip-10-0-0-1.ec2.internal",
+    "uptime_seconds": 86400,
+    "load_avg": [0.15, 0.1, 0.05],
+    "cpu_model": "Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz",
+    "mem_total_mib": 7863,
+    "mem_available_mib": 6054,
+    "swap_total_mib": 0,
+    "root_disk": {
+        "filesystem": "/dev/root",
+        "total_mib": 20480,
+        "used_mib": 5120,
+        "avail_mib": 15360,
+        "used_pct": 25,
+    },
+    "package_count": 642,
+    "running_services": ["cron.service", "ssh.service", "docker.service"],
+    "listening_ports": [22, 53, 443],
+    "listening_port_count": 3,
+    "containers": [
+        {"name": "web", "image": "nginx:alpine"},
+        {"name": "redis", "image": "redis:7"},
+    ],
+    "container_count": 2,
+    "reboot_required": True,
+    "passwordless_sudo": True,
+    "logged_in_users": ["ubuntu"],
+}
 
-def _inst(**kw) -> InstanceRecord:
+
+class _FakeConn:
+    async def run(self, _script: str, **_kw: Any) -> SimpleNamespace:
+        return SimpleNamespace(stdout=SAMPLE_PROBE_OUTPUT)
+
+
+def _inst(**kw: Any) -> InstanceRecord:
     base: dict[str, Any] = {
         "instance_id": "i-1",
         "instance_type": "t3.micro",
@@ -75,43 +124,9 @@ def _inst(**kw) -> InstanceRecord:
     return InstanceRecord(**base)
 
 
-def test_parse_probe_output_extracts_all_sections():
+def test_parse_probe_output_extracts_all_sections() -> None:
     facts = ssh.parse_probe_output(SAMPLE_PROBE_OUTPUT, "ubuntu", "10.0.0.1", 22)
-    assert facts["ssh_user"] == "ubuntu"
-    assert facts["ssh_host"] == "10.0.0.1"
-    assert facts["ssh_port"] == 22
-    assert facts["os_id"] == "ubuntu"
-    assert facts["os_version"] == "24.04"
-    assert facts["os_pretty_name"] == "Ubuntu 24.04.1 LTS"
-    assert facts["os_id_like"] == "debian"
-    assert facts["kernel"] == "6.8.0-1015-aws"
-    assert facts["architecture"] == "x86_64"
-    assert facts["hostname"] == "ip-10-0-0-1.ec2.internal"
-    assert facts["uptime_seconds"] == 86400
-    assert facts["load_avg"] == [0.15, 0.1, 0.05]
-    assert facts["cpu_model"] == "Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz"
-    assert facts["mem_total_mib"] == 7863
-    assert facts["mem_available_mib"] == 6054
-    assert facts["swap_total_mib"] == 0
-    assert facts["root_disk"] == {
-        "filesystem": "/dev/root",
-        "total_mib": 20480,
-        "used_mib": 5120,
-        "avail_mib": 15360,
-        "used_pct": 25,
-    }
-    assert facts["package_count"] == 642
-    assert facts["running_services"] == ["cron.service", "ssh.service", "docker.service"]
-    assert facts["listening_ports"] == [22, 53, 443]
-    assert facts["listening_port_count"] == 3
-    assert facts["containers"] == [
-        {"name": "web", "image": "nginx:alpine"},
-        {"name": "redis", "image": "redis:7"},
-    ]
-    assert facts["container_count"] == 2
-    assert facts["reboot_required"] is True
-    assert facts["passwordless_sudo"] is True
-    assert facts["logged_in_users"] == ["ubuntu"]
+    assert facts == _EXPECTED_PARSED_FACTS
 
 
 @pytest.mark.parametrize(
@@ -122,20 +137,20 @@ def test_parse_probe_output_extracts_all_sections():
         ("ubuntu/images/hvm-ssd/ubuntu-noble-24.04", "ubuntu"),
     ],
 )
-def test_ordered_candidate_users_prioritizes_distro_hint(ami_name, expected_first):
+def test_ordered_candidate_users_prioritizes_distro_hint(
+    ami_name: str, expected_first: str
+) -> None:
     users = ssh.ordered_candidate_users(_inst(), ami_name=ami_name)
     assert users[0] == expected_first
     assert set(ssh.DEFAULT_SSH_USERS).issubset(set(users))
 
-    # When explicit custom users are given, distro hints outside that set are not injected
     restricted = ssh.ordered_candidate_users(
         _inst(), users=("admin", "root"), ami_name="ubuntu/images/hvm-ssd/ubuntu-noble-24.04"
     )
     assert restricted == ["admin", "root"]
 
 
-def test_ordered_candidate_users_prioritizes_last_known_user():
-    # Even when AMI hints at amzn/ec2-user, last_known_user and ami_known_user come first
+def test_ordered_candidate_users_prioritizes_last_known_user() -> None:
     users = ssh.ordered_candidate_users(
         _inst(),
         ami_name="amzn2-ami-hvm",
@@ -144,13 +159,12 @@ def test_ordered_candidate_users_prioritizes_last_known_user():
     )
     assert users[:3] == ["centos", "ubuntu", "ec2-user"]
 
-    # Custom user not in DEFAULT_SSH_USERS is still tried first
     custom = ssh.ordered_candidate_users(_inst(), last_known_user="deploy")
     assert custom[0] == "deploy"
     assert custom[1:] == list(ssh.DEFAULT_SSH_USERS)
 
 
-def test_resolve_target_host_and_client_keys(tmp_path):
+def test_resolve_target_host_and_client_keys(tmp_path: Path) -> None:
     inst = _inst()
     assert ssh.resolve_target_host(inst) == "10.0.0.1"
     assert ssh.resolve_target_host(inst, prefer_public_ip=True) == "1.2.3.4"
@@ -174,24 +188,21 @@ def test_resolve_target_host_and_client_keys(tmp_path):
     assert keys == [str(pem), str(explicit), str(other), str(default_key)]
 
 
-def test_ssh_collector_rotates_users_and_handles_states():
+def test_ssh_collector_rotates_users_and_handles_states() -> None:
     attempts: list[tuple[str, str]] = []
 
     @asynccontextmanager
-    async def fake_connect(**kwargs):
+    async def fake_connect(**kwargs: Any) -> AsyncGenerator[_FakeConn]:
         host = kwargs["host"]
         user = kwargs["username"]
         attempts.append((host, user))
         if host == "10.0.0.99":
-            raise TimeoutError("timed out")
+            msg = "timed out"
+            raise TimeoutError(msg)
         if user != "ubuntu":
-            raise asyncssh.PermissionDenied("Permission denied")
-
-        class Conn:
-            async def run(self, script, check=False):
-                return SimpleNamespace(stdout=SAMPLE_PROBE_OUTPUT)
-
-        yield Conn()
+            msg = "Permission denied"
+            raise asyncssh.PermissionDenied(msg)
+        yield _FakeConn()
 
     collector = ssh.SshCollector(
         users=("ec2-user", "ubuntu", "debian"),
@@ -211,21 +222,24 @@ def test_ssh_collector_rotates_users_and_handles_states():
     ok = results["i-ok"]
     assert ok.status == "succeeded"
     assert ok.facts is not None
-    assert ok.facts["ssh_user"] == "ubuntu"
-    assert ok.facts["attempted_users"] == ["ec2-user", "ubuntu"]
-    assert results["i-stopped"].status == "skipped"
-    assert results["i-win"].status == "skipped"
-    assert results["i-noip"].status == "skipped"
-    assert results["i-timeout"].status == "failed"
+    assert (ok.facts["ssh_user"], ok.facts["attempted_users"]) == (
+        "ubuntu",
+        ["ec2-user", "ubuntu"],
+    )
+    assert (
+        results["i-stopped"].status,
+        results["i-win"].status,
+        results["i-noip"].status,
+        results["i-timeout"].status,
+    ) == ("skipped", "skipped", "skipped", "failed")
     assert ("10.0.0.99", "ec2-user") in attempts
-    assert ("10.0.0.99", "ubuntu") not in attempts  # aborted after timeout
+    assert ("10.0.0.99", "ubuntu") not in attempts
 
 
-def test_ssh_collector_all_users_denied_and_single_enrich():
-    @asynccontextmanager
-    async def always_denied(**kwargs):
-        raise asyncssh.PermissionDenied("denied")
-        yield  # pragma: no cover
+def test_ssh_collector_all_users_denied_and_single_enrich() -> None:
+    def always_denied(**_kwargs: Any) -> Any:
+        msg = "denied"
+        raise asyncssh.PermissionDenied(msg)
 
     collector = ssh.SshCollector(users=("ec2-user", "ubuntu"), connect_fn=always_denied)
     res = collector.enrich("111111111111", "us-east-1", _inst())
@@ -233,10 +247,9 @@ def test_ssh_collector_all_users_denied_and_single_enrich():
     assert "authentication failed" in (res.error or "")
 
 
-def test_cli_build_enrichers():
+def test_cli_build_enrichers() -> None:
     parser = cli.build_parser()
-    args_off = parser.parse_args(["run", "--profile", "p"])
-    assert cli._build_enrichers(args_off) == []
+    assert cli._build_enrichers(parser.parse_args(["run", "--profile", "p"])) == []
 
     args_on = parser.parse_args(
         [
@@ -253,31 +266,30 @@ def test_cli_build_enrichers():
     )
     enrichers = cli._build_enrichers(args_on)
     assert len(enrichers) == 1
-    assert isinstance(enrichers[0], ssh.SshCollector)
-    assert enrichers[0].users == ("ubuntu",)
-    assert enrichers[0].port == 2222
-    assert enrichers[0].prefer_public_ip is True
-    assert enrichers[0].only_unaccessed is False
+    e0 = enrichers[0]
+    assert isinstance(e0, ssh.SshCollector)
+    assert (e0.users, e0.port, e0.prefer_public_ip, e0.only_unaccessed) == (
+        ("ubuntu",),
+        2222,
+        True,
+        False,
+    )
 
     args_unaccessed = parser.parse_args(["run", "--profile", "p", "--ssh-only-unaccessed"])
     enrichers2 = cli._build_enrichers(args_unaccessed)
-    assert len(enrichers2) == 1
     assert isinstance(enrichers2[0], ssh.SshCollector)
     assert enrichers2[0].only_unaccessed is True
 
 
-def test_ssh_only_unaccessed_skips_succeeded_and_preserves_previous_data(monkeypatch):
+def test_ssh_only_unaccessed_skips_succeeded_and_preserves_previous_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     probed: list[str] = []
 
     @asynccontextmanager
-    async def fake_connect(**kwargs):
+    async def fake_connect(**kwargs: Any) -> AsyncGenerator[_FakeConn]:
         probed.append(kwargs["host"])
-
-        class Conn:
-            async def run(self, script, check=False):
-                return SimpleNamespace(stdout=SAMPLE_PROBE_OUTPUT)
-
-        yield Conn()
+        yield _FakeConn()
 
     inst_accessed = _inst(instance_id="i-accessed", private_ip="10.0.0.1")
     inst_new = _inst(instance_id="i-new", private_ip="10.0.0.2")
@@ -303,13 +315,12 @@ def test_ssh_only_unaccessed_skips_succeeded_and_preserves_previous_data(monkeyp
     monkeypatch.setattr(
         load,
         "get_accessed_ssh_instance_ids",
-        lambda db, acc, reg, ids: {"i-accessed"},
+        lambda *_a: {"i-accessed"},
     )
 
     db = MagicMock()
 
-    def fake_scalars(stmt):
-        # _load_instance queries by (aws_account_id, region, instance_id)
+    def fake_scalars(stmt: Any) -> SimpleNamespace:
         for inst_id, obj in rows_by_id.items():
             if inst_id in str(stmt.compile(compile_kwargs={"literal_binds": True})):
                 return SimpleNamespace(first=lambda obj=obj: obj)
@@ -325,36 +336,29 @@ def test_ssh_only_unaccessed_skips_succeeded_and_preserves_previous_data(monkeyp
     )
     enrichments = runner._run_enrichers(db, "111111111111", "us-east-1", data, [collector])
 
-    # Only i-new was probed; i-accessed was skipped by the enricher
     assert probed == ["10.0.0.2"]
     assert "ssh" not in enrichments["i-accessed"]
     assert enrichments["i-new"]["ssh"].status == "succeeded"
 
     counts = load.load_instances(db, "111111111111", "us-east-1", data, enrichments)
     assert counts.created == 1
-    assert existing_accessed.ssh_user == "ec2-user"
-    assert existing_accessed.ssh_os_id == "amzn"
+    assert (existing_accessed.ssh_user, existing_accessed.ssh_os_id) == ("ec2-user", "amzn")
     assert existing_accessed.ssh_facts == {"ssh_user": "ec2-user", "os_id": "amzn"}
-    assert rows_by_id["i-new"].ssh_user == "ubuntu"
-    assert rows_by_id["i-new"].ssh_os_id == "ubuntu"
+    assert (rows_by_id["i-new"].ssh_user, rows_by_id["i-new"].ssh_os_id) == ("ubuntu", "ubuntu")
 
 
-def test_ssh_retries_last_known_user_first():
+def test_ssh_retries_last_known_user_first() -> None:
     attempts: list[tuple[str, str]] = []
 
     @asynccontextmanager
-    async def fake_connect(**kwargs):
+    async def fake_connect(**kwargs: Any) -> AsyncGenerator[_FakeConn]:
         host = kwargs["host"]
         user = kwargs["username"]
         attempts.append((host, user))
         if user != "debian":
-            raise asyncssh.PermissionDenied("Permission denied")
-
-        class Conn:
-            async def run(self, script, check=False):
-                return SimpleNamespace(stdout=SAMPLE_PROBE_OUTPUT)
-
-        yield Conn()
+            msg = "Permission denied"
+            raise asyncssh.PermissionDenied(msg)
+        yield _FakeConn()
 
     inst = _inst(instance_id="i-known", private_ip="10.0.0.10")
     data = Collected(instances=[inst])
@@ -362,7 +366,7 @@ def test_ssh_retries_last_known_user_first():
     db = MagicMock()
     db.execute.side_effect = [
         SimpleNamespace(all=lambda: [("i-known", "debian")]),
-        SimpleNamespace(all=lambda: []),
+        SimpleNamespace(all=list),
     ]
 
     collector = ssh.SshCollector(
@@ -375,35 +379,29 @@ def test_ssh_retries_last_known_user_first():
     res = enrichments["i-known"]["ssh"]
     assert res.status == "succeeded"
     assert res.facts is not None
-    assert res.facts["ssh_user"] == "debian"
-    assert res.facts["attempted_users"] == ["debian"]
+    assert (res.facts["ssh_user"], res.facts["attempted_users"]) == ("debian", ["debian"])
 
 
-def test_ssh_live_ami_learning_and_cached_keys(tmp_path):
+def test_ssh_live_ami_learning_and_cached_keys(tmp_path: Path) -> None:
     attempts: list[tuple[str, str]] = []
     seen_kwargs: list[dict[str, Any]] = []
 
     @asynccontextmanager
-    async def fake_connect(**kwargs):
+    async def fake_connect(**kwargs: Any) -> AsyncGenerator[_FakeConn]:
         host = kwargs["host"]
         user = kwargs["username"]
         attempts.append((host, user))
         seen_kwargs.append(kwargs)
         if user != "centos":
-            raise asyncssh.PermissionDenied("Permission denied")
-
-        class Conn:
-            async def run(self, script, check=False):
-                return SimpleNamespace(stdout=SAMPLE_PROBE_OUTPUT)
-
-        yield Conn()
+            msg = "Permission denied"
+            raise asyncssh.PermissionDenied(msg)
+        yield _FakeConn()
 
     key_dir = tmp_path / "keys"
     key_dir.mkdir()
     pem = key_dir / "my-key.pem"
     pem.write_text("DUMMY_KEY")
 
-    # Concurrency=1 ensures i-1 finishes and populates learned_ami_users before i-2 starts
     collector = ssh.SshCollector(
         users=("root", "admin", "ec2-user", "centos"),
         key_dir=key_dir,
@@ -420,25 +418,25 @@ def test_ssh_live_ami_learning_and_cached_keys(tmp_path):
 
     assert results["i-1"].facts is not None
     assert results["i-1"].facts["attempted_users"] == ["root", "admin", "ec2-user", "centos"]
-    # Second instance with same AMI immediately tries 'centos' first
     assert results["i-2"].facts is not None
     assert results["i-2"].facts["attempted_users"] == ["centos"]
-    assert seen_kwargs[0]["connect_timeout"] == 3.5
-    assert seen_kwargs[0]["login_timeout"] == 3.5
+    assert (seen_kwargs[0]["connect_timeout"], seen_kwargs[0]["login_timeout"]) == (3.5, 3.5)
     assert collector._load_key_cached(str(pem)) == str(pem)
     assert collector._load_key_cached(str(pem)) == str(pem)
 
 
-def test_cli_daemon_env_and_max_cycles(monkeypatch):
+def test_cli_daemon_env_and_max_cycles(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EC2_SCRAPE_PROFILES", "prof-a,prof-b")
     monkeypatch.setenv("EC2_SCRAPE_REGIONS", "us-east-1")
     monkeypatch.setenv("EC2_SCRAPE_SSH", "true")
     monkeypatch.setenv("EC2_SCRAPE_INTERVAL", "0.01")
 
-    monkeypatch.setattr(cli.db, "connect", lambda dsn: MagicMock())
+    monkeypatch.setattr(cli.db, "connect", lambda _dsn: MagicMock())
     calls: list[tuple[list[str], list[str] | None]] = []
 
-    def fake_run(conn, profiles, regions, all_regions, **kw):
+    def fake_run(
+        _conn: Any, profiles: list[str], regions: list[str] | None, *_a: Any, **_kw: Any
+    ) -> runner.RunResult:
         calls.append((profiles, regions))
         return runner.RunResult(status="succeeded", combos=[])
 
@@ -447,7 +445,6 @@ def test_cli_daemon_env_and_max_cycles(monkeypatch):
     assert rc == 0
     assert calls == [(["prof-a", "prof-b"], ["us-east-1"]), (["prof-a", "prof-b"], ["us-east-1"])]
 
-    # Missing profile error when env var not set
     monkeypatch.delenv("EC2_SCRAPE_PROFILES", raising=False)
     assert cli.main(["daemon", "--max-cycles", "1"]) == cli.EXIT_USAGE
     assert cli.main(["daemon", "--profile", "p", "--interval", "0"]) == cli.EXIT_USAGE

@@ -1,5 +1,7 @@
 """`ec2-scrape` command line interface."""
 
+from __future__ import annotations
+
 import argparse
 import os
 import signal
@@ -7,12 +9,24 @@ import sys
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from ec2_scraping import db, report, runner, session, ssh
-from ec2_scraping.models import InstanceEnricher, RunResult
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from ec2_scraping.models import InstanceEnricher, RunResult
 
 EXIT_OK, EXIT_PARTIAL, EXIT_FAILED, EXIT_USAGE = 0, 1, 2, 64
 _EXIT = {"succeeded": EXIT_OK, "partial": EXIT_PARTIAL, "failed": EXIT_FAILED}
+
+
+def _emit(msg: str, *, err: bool = False, flush: bool = False) -> None:
+    stream = sys.stderr if err else sys.stdout
+    stream.write(f"{msg}\n")
+    if flush:
+        stream.flush()
 
 
 def _env_list(name: str) -> list[str] | None:
@@ -40,7 +54,7 @@ def _env_float(name: str, default: float) -> float:
 
 
 class _Parser(argparse.ArgumentParser):
-    def error(self, message):  # usage errors use exit code 64 per the contract
+    def error(self, message: str) -> NoReturn:  # usage errors use exit code 64 per the contract
         self.print_usage(sys.stderr)
         self.exit(EXIT_USAGE, f"{self.prog}: error: {message}\n")
 
@@ -55,8 +69,67 @@ def _add_filter_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--state", action="append", help="filter by instance state (repeatable)")
 
 
+def _add_ssh_args(p: argparse.ArgumentParser, *, use_env: bool) -> None:
+    p.add_argument(
+        "--ssh",
+        action="store_true",
+        default=_env_bool("EC2_SCRAPE_SSH") if use_env else False,
+        help="probe running instances over SSH using common usernames to collect OS/system facts",
+    )
+    p.add_argument(
+        "--ssh-user",
+        action="append",
+        dest="ssh_users",
+        default=_env_list("EC2_SCRAPE_SSH_USERS") if use_env else None,
+        help="candidate SSH username (repeatable; defaults to common Linux distro usernames)",
+    )
+    p.add_argument(
+        "--ssh-key",
+        action="append",
+        dest="ssh_keys",
+        default=_env_list("EC2_SCRAPE_SSH_KEYS") if use_env else None,
+        help="private key file path to offer during SSH auth (repeatable)",
+    )
+    p.add_argument(
+        "--ssh-key-dir",
+        default=os.environ.get("EC2_SCRAPE_SSH_KEY_DIR") if use_env else None,
+        help="directory of private keys (matches <key_name> or <key_name>.pem first)",
+    )
+    p.add_argument(
+        "--ssh-port",
+        type=int,
+        default=_env_int("EC2_SCRAPE_SSH_PORT", 22) if use_env else 22,
+        help="SSH port (default: 22)",
+    )
+    p.add_argument(
+        "--ssh-timeout",
+        type=float,
+        default=_env_float("EC2_SCRAPE_SSH_TIMEOUT", 5.0) if use_env else 5.0,
+        help="SSH connection timeout in seconds (default: 5.0)",
+    )
+    p.add_argument(
+        "--ssh-concurrency",
+        type=int,
+        default=_env_int("EC2_SCRAPE_SSH_CONCURRENCY", 32) if use_env else 32,
+        help="maximum concurrent SSH instance probes (default: 32)",
+    )
+    p.add_argument(
+        "--ssh-prefer-public-ip",
+        action="store_true",
+        default=_env_bool("EC2_SCRAPE_SSH_PREFER_PUBLIC_IP") if use_env else False,
+        help="connect to public_ip before private_ip when probing over SSH",
+    )
+    p.add_argument(
+        "--ssh-only-unaccessed",
+        action="store_true",
+        default=_env_bool("EC2_SCRAPE_SSH_ONLY_UNACCESSED") if use_env else False,
+        help="only probe instances not yet accessed via SSH and keep previous SSH data",
+    )
+
+
 def _add_scrape_args(p: argparse.ArgumentParser, *, profile_required: bool = True) -> None:
-    env_profiles = None if profile_required else _env_list("EC2_SCRAPE_PROFILES")
+    use_env = not profile_required
+    env_profiles = _env_list("EC2_SCRAPE_PROFILES") if use_env else None
     p.add_argument(
         "--profile",
         action="append",
@@ -67,74 +140,20 @@ def _add_scrape_args(p: argparse.ArgumentParser, *, profile_required: bool = Tru
     p.add_argument(
         "--region",
         action="append",
-        default=None if profile_required else _env_list("EC2_SCRAPE_REGIONS"),
+        default=_env_list("EC2_SCRAPE_REGIONS") if use_env else None,
         help="region (repeatable; or env EC2_SCRAPE_REGIONS=r1,r2 in daemon mode)",
     )
     p.add_argument(
         "--all-regions",
         action="store_true",
-        default=False if profile_required else _env_bool("EC2_SCRAPE_ALL_REGIONS"),
+        default=_env_bool("EC2_SCRAPE_ALL_REGIONS") if use_env else False,
         help="all enabled regions (or env EC2_SCRAPE_ALL_REGIONS=1 in daemon mode)",
     )
     p.add_argument(
         "--dsn",
         help=f"database DSN (default env {db.DSN_ENV}, falling back to {db.DEFAULT_SQLITE_DSN})",
     )
-    p.add_argument(
-        "--ssh",
-        action="store_true",
-        default=False if profile_required else _env_bool("EC2_SCRAPE_SSH"),
-        help="probe running instances over SSH using common usernames to collect OS/system facts",
-    )
-    p.add_argument(
-        "--ssh-user",
-        action="append",
-        dest="ssh_users",
-        default=None if profile_required else _env_list("EC2_SCRAPE_SSH_USERS"),
-        help="candidate SSH username (repeatable; defaults to common Linux distro usernames)",
-    )
-    p.add_argument(
-        "--ssh-key",
-        action="append",
-        dest="ssh_keys",
-        default=None if profile_required else _env_list("EC2_SCRAPE_SSH_KEYS"),
-        help="private key file path to offer during SSH auth (repeatable)",
-    )
-    p.add_argument(
-        "--ssh-key-dir",
-        default=None if profile_required else os.environ.get("EC2_SCRAPE_SSH_KEY_DIR"),
-        help="directory of private keys (matches <key_name> or <key_name>.pem first)",
-    )
-    p.add_argument(
-        "--ssh-port",
-        type=int,
-        default=22 if profile_required else _env_int("EC2_SCRAPE_SSH_PORT", 22),
-        help="SSH port (default: 22)",
-    )
-    p.add_argument(
-        "--ssh-timeout",
-        type=float,
-        default=5.0 if profile_required else _env_float("EC2_SCRAPE_SSH_TIMEOUT", 5.0),
-        help="SSH connection timeout in seconds (default: 5.0)",
-    )
-    p.add_argument(
-        "--ssh-concurrency",
-        type=int,
-        default=32 if profile_required else _env_int("EC2_SCRAPE_SSH_CONCURRENCY", 32),
-        help="maximum concurrent SSH instance probes (default: 32)",
-    )
-    p.add_argument(
-        "--ssh-prefer-public-ip",
-        action="store_true",
-        default=False if profile_required else _env_bool("EC2_SCRAPE_SSH_PREFER_PUBLIC_IP"),
-        help="connect to public_ip before private_ip when probing over SSH",
-    )
-    p.add_argument(
-        "--ssh-only-unaccessed",
-        action="store_true",
-        default=False if profile_required else _env_bool("EC2_SCRAPE_SSH_ONLY_UNACCESSED"),
-        help="only probe instances not yet accessed via SSH and keep previous SSH data",
-    )
+    _add_ssh_args(p, use_env=use_env)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -190,7 +209,7 @@ def format_summary(result: RunResult) -> str:
     return "\n".join(lines)
 
 
-def _build_enrichers(args) -> list[InstanceEnricher]:
+def _build_enrichers(args: argparse.Namespace) -> list[InstanceEnricher]:
     if not (getattr(args, "ssh", False) or getattr(args, "ssh_only_unaccessed", False)):
         return []
     return [
@@ -207,14 +226,14 @@ def _build_enrichers(args) -> list[InstanceEnricher]:
     ]
 
 
-def _cmd_run(args, open_session=session.open_session) -> int:
-    if args.all_regions and args.region:
-        print("ec2-scrape: error: --all-regions cannot be combined with --region", file=sys.stderr)
-        return EXIT_USAGE
-    enrichers = _build_enrichers(args)
+def _run_once(
+    args: argparse.Namespace,
+    open_session: Callable[..., Any],
+    enrichers: list[InstanceEnricher],
+) -> RunResult:
     conn = db.connect(args.dsn)
     try:
-        result = runner.run(
+        return runner.run(
             conn,
             args.profile,
             args.region,
@@ -224,26 +243,56 @@ def _cmd_run(args, open_session=session.open_session) -> int:
         )
     finally:
         conn.close()
-    print(format_summary(result))
+
+
+def _cmd_run(
+    args: argparse.Namespace,
+    open_session: Callable[..., Any] = session.open_session,
+) -> int:
+    if args.all_regions and args.region:
+        _emit("ec2-scrape: error: --all-regions cannot be combined with --region", err=True)
+        return EXIT_USAGE
+    result = _run_once(args, open_session, _build_enrichers(args))
+    _emit(format_summary(result))
     return _EXIT[result.status]
 
 
+def _validate_daemon_args(args: argparse.Namespace) -> bool:
+    if not args.profile:
+        _emit("ec2-scrape: error: daemon requires --profile or EC2_SCRAPE_PROFILES", err=True)
+        return False
+    if args.all_regions and args.region:
+        _emit("ec2-scrape: error: --all-regions cannot be combined with --region", err=True)
+        return False
+    if args.interval <= 0:
+        _emit("ec2-scrape: error: --interval must be > 0", err=True)
+        return False
+    return True
+
+
+def _run_daemon_cycle(
+    cycle: int,
+    args: argparse.Namespace,
+    open_session: Callable[..., Any],
+    enrichers: list[InstanceEnricher],
+) -> int:
+    ts = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _emit(f"[{ts}] Starting scrape cycle #{cycle}...", flush=True)
+    try:
+        result = _run_once(args, open_session, enrichers)
+        _emit(format_summary(result), flush=True)
+        return _EXIT[result.status]
+    except Exception as exc:
+        _emit(f"[{ts}] Scrape cycle #{cycle} error: {exc}", err=True, flush=True)
+        return EXIT_FAILED
+
+
 def _cmd_daemon(
-    args,
-    open_session=session.open_session,
+    args: argparse.Namespace,
+    open_session: Callable[..., Any] = session.open_session,
     stop_event: threading.Event | None = None,
 ) -> int:
-    if not args.profile:
-        print(
-            "ec2-scrape: error: daemon requires --profile or EC2_SCRAPE_PROFILES",
-            file=sys.stderr,
-        )
-        return EXIT_USAGE
-    if args.all_regions and args.region:
-        print("ec2-scrape: error: --all-regions cannot be combined with --region", file=sys.stderr)
-        return EXIT_USAGE
-    if args.interval <= 0:
-        print("ec2-scrape: error: --interval must be > 0", file=sys.stderr)
+    if not _validate_daemon_args(args):
         return EXIT_USAGE
 
     stop = stop_event if stop_event is not None else threading.Event()
@@ -256,37 +305,17 @@ def _cmd_daemon(
     last_code = EXIT_OK
     while not stop.is_set():
         cycle += 1
-        ts = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        print(f"[{ts}] Starting scrape cycle #{cycle}...", flush=True)
-        try:
-            conn = db.connect(args.dsn)
-            try:
-                result = runner.run(
-                    conn,
-                    args.profile,
-                    args.region,
-                    args.all_regions,
-                    open_session=open_session,
-                    enrichers=enrichers,
-                )
-            finally:
-                conn.close()
-            print(format_summary(result), flush=True)
-            last_code = _EXIT[result.status]
-        except Exception as exc:
-            print(f"[{ts}] Scrape cycle #{cycle} error: {exc}", file=sys.stderr, flush=True)
-            last_code = EXIT_FAILED
-
+        last_code = _run_daemon_cycle(cycle, args, open_session, enrichers)
         if args.max_cycles is not None and cycle >= args.max_cycles:
             break
         if stop.wait(args.interval):
             break
 
-    print("Daemon stopped.", flush=True)
+    _emit("Daemon stopped.", flush=True)
     return last_code
 
 
-def _cmd_summary(args) -> int:
+def _cmd_summary(args: argparse.Namespace) -> int:
     conn = db.connect(args.dsn)
     try:
         summary = report.summarize_instances(
@@ -297,11 +326,11 @@ def _cmd_summary(args) -> int:
         )
     finally:
         conn.close()
-    print(report.format_inventory_summary(summary))
+    _emit(report.format_inventory_summary(summary))
     return EXIT_OK
 
 
-def _cmd_export(args) -> int:
+def _cmd_export(args: argparse.Namespace) -> int:
     conn = db.connect(args.dsn)
     try:
         if args.output and args.output != "-":
@@ -339,7 +368,7 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_daemon(args)
         return _cmd_run(args)
     except (db.ConfigError, session.SsoLoginRequired) as exc:
-        print(f"ec2-scrape: error: {exc}", file=sys.stderr)
+        _emit(f"ec2-scrape: error: {exc}", err=True)
         return EXIT_USAGE if isinstance(exc, db.ConfigError) else EXIT_FAILED
 
 

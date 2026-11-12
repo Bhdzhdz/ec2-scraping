@@ -1,19 +1,21 @@
 """Region resolution, loader, runner, enricher, and CLI tests."""
 
+from __future__ import annotations
+
 from datetime import datetime
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 import boto3
 import pytest
 from botocore.exceptions import ClientError, EndpointConnectionError
 from botocore.stub import Stubber
+from tests.integration.helpers import make_ssh_enrichment
 
 from ec2_scraping import cli, load, runner
-from ec2_scraping.db.models import Instance
 from ec2_scraping.models import (
     AmiRecord,
     Collected,
-    EnrichmentResult,
     InstanceRecord,
     NetworkInterfaceRecord,
     TypeInfo,
@@ -22,16 +24,23 @@ from ec2_scraping.models import (
 )
 from ec2_scraping.session import ProfileSession, SsoLoginRequired, resolve_regions
 
+if TYPE_CHECKING:
+    from ec2_scraping.db.models import Instance
+    from ec2_scraping.models import EnrichmentResult
 
-def test_all_regions_uses_enabled_regions_only():
+
+def test_all_regions_uses_enabled_regions_only() -> None:
     ec2 = boto3.client(
-        "ec2", region_name="us-east-1", aws_access_key_id="x", aws_secret_access_key="x"
+        "ec2",
+        region_name="us-east-1",
+        aws_access_key_id="x",
+        aws_secret_access_key="x",  # noqa: S106
     )
 
     class Boto:
         region_name = "us-east-1"
 
-        def client(self, *_, **__):
+        def client(self, *_args: Any, **_kwargs: Any) -> Any:
             return ec2
 
     with Stubber(ec2) as stub:
@@ -44,7 +53,7 @@ def test_all_regions_uses_enabled_regions_only():
     assert regions == ["eu-west-1", "us-west-2"]
 
 
-def test_explicit_and_default_regions():
+def test_explicit_and_default_regions() -> None:
     class Boto:
         region_name = "us-east-2"
 
@@ -53,23 +62,23 @@ def test_explicit_and_default_regions():
     assert resolve_regions(ps, None, False) == ["us-east-2"]
 
 
-def test_all_regions_with_region_is_usage_error():
+def test_all_regions_with_region_is_usage_error() -> None:
     assert cli.main(["run", "--profile", "p", "--all-regions", "--region", "us-east-1"]) == 64
 
 
-def test_missing_required_profile_is_usage_error():
+def test_missing_required_profile_is_usage_error() -> None:
     with pytest.raises(SystemExit) as info:
         cli.main(["run"])
     assert info.value.code == 64
 
 
-def test_invalid_dsn_is_config_error():
+def test_invalid_dsn_is_config_error() -> None:
     assert (
         cli.main(["run", "--profile", "p", "--region", "us-east-1", "--dsn", "postgres://x"]) == 64
     )
 
 
-def test_load_instances_enrichers_runner_and_cli_summary(monkeypatch):
+def _sample_collected() -> Collected:
     inst_rec = InstanceRecord(
         instance_id="i-1",
         instance_type="g4dn.xlarge",
@@ -104,7 +113,7 @@ def test_load_instances_enrichers_runner_and_cli_summary(monkeypatch):
         virtualization_type="hvm",
         name="base",
     )
-    data = Collected(
+    return Collected(
         instances=[inst_rec],
         amis={"ami-1": ami_rec},
         type_info={
@@ -122,81 +131,109 @@ def test_load_instances_enrichers_runner_and_cli_summary(monkeypatch):
         subnet_cidrs={"subnet-1": "10.0.0.0/24"},
     )
 
+
+class _FakeSshEnricher:
+    name = "ssh"
+
+    def enrich(self, _account_id: str, _region: str, _inst: InstanceRecord) -> EnrichmentResult:
+        return make_ssh_enrichment(
+            hostname="web-1",
+            uptime_seconds=3600,
+            package_count=500,
+            listening_port_count=2,
+            container_count=1,
+            reboot_required=False,
+        )
+
+
+class _FailingCustomEnricher:
+    name = "ssm"
+
+    def enrich(self, _account_id: str, _region: str, _inst: InstanceRecord) -> EnrichmentResult:
+        msg = "agent offline"
+        raise RuntimeError(msg)
+
+
+class _FakePS:
+    default_region = "us-east-1"
+    account_id = "111111111111"
+
+    def __init__(self, profile: str) -> None:
+        self.profile = profile
+
+    def ec2(self, region: str) -> str:
+        return region
+
+
+def _fake_open(profile: str) -> _FakePS:
+    if profile == "sso-expired":
+        raise SsoLoginRequired(profile)
+    if profile == "bad-profile":
+        msg = "boom"
+        raise RuntimeError(msg)
+    return _FakePS(profile)
+
+
+def _assert_initial_load(db: Any, data: Collected, stored: list[Instance]) -> Instance:
+    c1 = load.load_instances(db, "111111111111", "us-east-1", data)
+    assert (c1.created, c1.updated, c1.unchanged) == (1, 0, 0)
+    row = stored[0]
+    assert (row.instance_family, row.iam_instance_profile_name, row.root_volume_id) == (
+        "g4dn",
+        "web-role",
+        "vol-1",
+    )
+    assert (row.root_volume_size_gib, row.ebs_total_size_gib, row.ebs_all_encrypted) == (
+        50,
+        50,
+        True,
+    )
+    assert (row.eni_count, row.security_group_count) == (1, 1)
+    c2 = load.load_instances(db, "111111111111", "us-east-1", data)
+    assert (c2.created, c2.updated, c2.unchanged) == (0, 0, 1)
+    return row
+
+
+def _assert_enriched_row(row: Instance) -> None:
+    assert (row.ssh_status, row.ssh_user, row.ssh_os_id, row.ssh_os_version) == (
+        "succeeded",
+        "ubuntu",
+        "ubuntu",
+        "24.04",
+    )
+    assert (row.ssh_os_pretty_name, row.ssh_kernel, row.ssh_hostname) == (
+        "Ubuntu 24.04 LTS",
+        "6.8.0",
+        "web-1",
+    )
+    assert (
+        row.ssh_uptime_seconds,
+        row.ssh_package_count,
+        row.ssh_listening_port_count,
+        row.ssh_container_count,
+        row.ssh_reboot_required,
+    ) == (3600, 500, 2, 1, False)
+    assert row.extra_facts is not None
+    assert row.extra_facts["ssm"]["status"] == "failed"
+
+
+def test_load_instances_enrichers_runner_and_cli_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _sample_collected()
     stored: list[Instance] = []
 
     class FakeScalars:
-        def first(self):
+        def first(self) -> Instance | None:
             return stored[0] if stored else None
 
     db = MagicMock()
     db.scalars.side_effect = lambda _: FakeScalars()
     db.add.side_effect = stored.append
 
-    # 1. Created
-    c1 = load.load_instances(db, "111111111111", "us-east-1", data)
-    assert (c1.created, c1.updated, c1.unchanged) == (1, 0, 0)
-    row = stored[0]
-    assert row.instance_family == "g4dn"
-    assert row.iam_instance_profile_name == "web-role"
-    assert row.root_volume_id == "vol-1"
-    assert row.root_volume_size_gib == 50
-    assert row.ebs_total_size_gib == 50
-    assert row.ebs_all_encrypted is True
-    assert row.eni_count == 1
-    assert row.security_group_count == 1
+    row = _assert_initial_load(db, data, stored)
 
-    # 2. Unchanged
-    c2 = load.load_instances(db, "111111111111", "us-east-1", data)
-    assert (c2.created, c2.updated, c2.unchanged) == (0, 0, 1)
-
-    # 3. Updated via enrichers (SSH + custom enricher)
-    class FakeSshEnricher:
-        name = "ssh"
-
-        def enrich(self, aws_account_id: str, region: str, instance: InstanceRecord):
-            return EnrichmentResult(
-                status="succeeded",
-                facts={
-                    "ssh_user": "ubuntu",
-                    "ssh_host": "10.0.0.1",
-                    "ssh_port": 22,
-                    "os_id": "ubuntu",
-                    "os_version": "24.04",
-                    "os_pretty_name": "Ubuntu 24.04 LTS",
-                    "kernel": "6.8.0",
-                    "hostname": "web-1",
-                    "uptime_seconds": 3600,
-                    "package_count": 500,
-                    "listening_port_count": 2,
-                    "container_count": 1,
-                    "reboot_required": False,
-                },
-            )
-
-    class FailingCustomEnricher:
-        name = "ssm"
-
-        def enrich(self, aws_account_id: str, region: str, instance: InstanceRecord):
-            raise RuntimeError("agent offline")
-
-    class FakePS:
-        default_region = "us-east-1"
-        account_id = "111111111111"
-
-        def __init__(self, profile: str):
-            self.profile = profile
-
-        def ec2(self, region: str):
-            return region
-
-    def fake_open(profile: str):
-        if profile == "sso-expired":
-            raise SsoLoginRequired(profile)
-        if profile == "bad-profile":
-            raise RuntimeError("boom")
-        return FakePS(profile)
-
-    def fake_collect(region: str, account_id: str):
+    def fake_collect(region: str, _account_id: str) -> Collected:
         if region == "opt-in":
             raise ClientError({"Error": {"Code": "OptInRequired"}}, "DescribeInstances")
         if region == "offline":
@@ -207,33 +244,20 @@ def test_load_instances_enrichers_runner_and_cli_summary(monkeypatch):
         db,
         ["ok", "sso-expired", "bad-profile"],
         ["us-east-1", "opt-in", "offline"],
-        open_session=fake_open,
+        open_session=_fake_open,
         collect_fn=fake_collect,
-        enrichers=[FakeSshEnricher(), FailingCustomEnricher()],
+        enrichers=[_FakeSshEnricher(), _FailingCustomEnricher()],
     )
     assert res.status == "partial"
-    assert row.ssh_status == "succeeded"
-    assert row.ssh_user == "ubuntu"
-    assert row.ssh_os_id == "ubuntu"
-    assert row.ssh_os_version == "24.04"
-    assert row.ssh_os_pretty_name == "Ubuntu 24.04 LTS"
-    assert row.ssh_kernel == "6.8.0"
-    assert row.ssh_hostname == "web-1"
-    assert row.ssh_uptime_seconds == 3600
-    assert row.ssh_package_count == 500
-    assert row.ssh_listening_port_count == 2
-    assert row.ssh_container_count == 1
-    assert row.ssh_reboot_required is False
-    assert row.extra_facts is not None
-    assert row.extra_facts["ssm"]["status"] == "failed"
+    _assert_enriched_row(row)
 
     summary = cli.format_summary(res)
     assert "Scrape run: partial" in summary
     assert "ok/us-east-1: instances" in summary
     assert "Failures:" in summary
 
-    monkeypatch.setattr(cli.db, "connect", lambda dsn: db)
-    monkeypatch.setattr(cli.runner, "run", lambda *a, **kw: res)
+    monkeypatch.setattr(cli.db, "connect", lambda _dsn: db)
+    monkeypatch.setattr(cli.runner, "run", lambda *_a, **_kw: res)
     assert (
         cli.main(["run", "--profile", "ok", "--region", "us-east-1", "--dsn", "mysql://u@h/d"]) == 1
     )

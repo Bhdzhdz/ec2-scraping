@@ -9,6 +9,7 @@ dependencies = [
     "alembic>=1.13",
     "asyncssh>=2.14",
     "boto3>=1.43.114",
+    "botocore>=1.35.0",
     "pymysql>=1.2.3",
     "sqlalchemy>=2.0",
 ]
@@ -46,6 +47,7 @@ src = ["src", "tests"]
 output-format = "concise"
 
 [tool.ruff.lint]
+ignore = ["ANN401"]
 select = [
     "E",    # pycodestyle errors
     "F",    # pyflakes
@@ -89,6 +91,8 @@ docstring-code-format = true
 
 [tool.deptry]
 extend_exclude = ["tests"]
+known_first_party = ["ec2_scraping"]
+ignore = ["DEP002"]
 
 [tool.vulture]
 paths = ["src", "tests"]

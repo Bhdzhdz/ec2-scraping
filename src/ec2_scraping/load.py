@@ -1,13 +1,27 @@
 """Transactional upserts of collected instances and enrichments into the single-table schema."""
 
+from __future__ import annotations
+
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
 
 from ec2_scraping.db.models import Instance
-from ec2_scraping.models import Collected, Counts, EnrichmentResult, InstanceRecord
+from ec2_scraping.models import Counts
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+
+    from ec2_scraping.models import (
+        AmiRecord,
+        Collected,
+        EnrichmentResult,
+        InstanceRecord,
+        TypeInfo,
+        VolumeAttachment,
+        VolumeInfo,
+    )
 
 
 def _clip(value: str | None, size: int) -> str | None:
@@ -78,8 +92,47 @@ def load_instances(
     counts = Counts()
     for inst in data.instances:
         inst_enrichments = (enrichments or {}).get(inst.instance_id)
-        counts.add(_load_instance(db, aws_account_id, region, inst, data, inst_enrichments))
+        cols = _build_instance_cols(inst, data, inst_enrichments)
+        counts.add(_upsert_instance(db, aws_account_id, region, inst.instance_id, cols))
     return counts
+
+
+def _volume_entry(att: VolumeAttachment, vinfo: VolumeInfo | None) -> dict[str, Any]:
+    if not vinfo:
+        return {
+            "device_name": att.device_name,
+            "volume_id": att.volume_id,
+            "size_gib": None,
+            "volume_type": None,
+            "encrypted": None,
+            "iops": None,
+            "throughput": None,
+            "delete_on_termination": att.delete_on_termination,
+        }
+    return {
+        "device_name": att.device_name,
+        "volume_id": att.volume_id,
+        "size_gib": vinfo.size_gib,
+        "volume_type": vinfo.volume_type,
+        "encrypted": vinfo.encrypted,
+        "iops": vinfo.iops,
+        "throughput": vinfo.throughput,
+        "delete_on_termination": att.delete_on_termination,
+    }
+
+
+def _root_volume_fields(
+    root_vol: dict[str, Any] | None,
+) -> tuple[str | None, int | None, str | None, bool | None]:
+    if not root_vol:
+        return None, None, None, None
+    enc = root_vol["encrypted"]
+    return (
+        root_vol["volume_id"],
+        root_vol["size_gib"],
+        root_vol["volume_type"],
+        bool(enc) if enc is not None else None,
+    )
 
 
 def _build_volume_payload(
@@ -94,64 +147,136 @@ def _build_volume_payload(
     int,
     bool | None,
 ]:
-    vol_list: list[dict[str, Any]] = []
-    root_vol_id: str | None = None
-    root_size: int | None = None
-    root_type: str | None = None
-    root_encrypted: bool | None = None
-    total_size = 0
-    encrypted_flags: list[bool] = []
-
-    for att in sorted(inst.volumes, key=lambda v: v.device_name):
-        vinfo = data.volume_info.get(att.volume_id)
-        size_gib = vinfo.size_gib if vinfo else None
-        vtype = vinfo.volume_type if vinfo else None
-        enc = vinfo.encrypted if vinfo else None
-        if size_gib is not None:
-            total_size += size_gib
-        if enc is not None:
-            encrypted_flags.append(bool(enc))
-        if inst.root_device_name and att.device_name == inst.root_device_name:
-            root_vol_id = att.volume_id
-            root_size = size_gib
-            root_type = vtype
-            root_encrypted = bool(enc) if enc is not None else None
-        vol_list.append(
-            {
-                "device_name": att.device_name,
-                "volume_id": att.volume_id,
-                "size_gib": size_gib,
-                "volume_type": vtype,
-                "encrypted": enc,
-                "iops": vinfo.iops if vinfo else None,
-                "throughput": vinfo.throughput if vinfo else None,
-                "delete_on_termination": att.delete_on_termination,
-            }
-        )
-
-    all_encrypted = all(encrypted_flags) if encrypted_flags else None
+    vol_list = [
+        _volume_entry(att, data.volume_info.get(att.volume_id))
+        for att in sorted(inst.volumes, key=lambda v: v.device_name)
+    ]
+    total_size = sum(v["size_gib"] or 0 for v in vol_list)
+    enc_flags = [bool(v["encrypted"]) for v in vol_list if v["encrypted"] is not None]
+    all_encrypted = all(enc_flags) if enc_flags else None
+    root_vol = (
+        next((v for v in vol_list if v["device_name"] == inst.root_device_name), None)
+        if inst.root_device_name
+        else None
+    )
+    root_vol_id, root_size, root_type, root_enc = _root_volume_fields(root_vol)
     return (
         vol_list,
         root_vol_id,
         root_size,
         root_type,
-        root_encrypted,
+        root_enc,
         len(vol_list),
         total_size,
         all_encrypted,
     )
 
 
-def _load_instance(
-    db: Session,
-    aws_account_id: str,
-    region: str,
+def _type_columns(tinfo: TypeInfo | None) -> dict[str, Any]:
+    if not tinfo:
+        return {
+            "vcpu": None,
+            "memory_mib": None,
+            "gpu_count": None,
+            "gpu_model": None,
+            "gpu_memory_mib": None,
+            "instance_storage_gib": None,
+            "network_performance": None,
+            "is_current_generation": None,
+            "is_burstable": None,
+            "is_bare_metal": None,
+        }
+    return {
+        "vcpu": tinfo.vcpu,
+        "memory_mib": tinfo.memory_mib,
+        "gpu_count": tinfo.gpu_count,
+        "gpu_model": _clip(tinfo.gpu_model, 64),
+        "gpu_memory_mib": tinfo.gpu_memory_mib,
+        "instance_storage_gib": tinfo.instance_storage_gib,
+        "network_performance": _clip(tinfo.network_performance, 64),
+        "is_current_generation": tinfo.is_current_generation,
+        "is_burstable": tinfo.is_burstable,
+        "is_bare_metal": tinfo.is_bare_metal,
+    }
+
+
+def _ami_columns(ami: AmiRecord | None) -> dict[str, Any]:
+    if not ami:
+        return {
+            "ami_owner_aws_account_id": None,
+            "ami_name": None,
+            "ami_description": None,
+            "ami_creation_date": None,
+            "ami_state": None,
+            "ami_architecture": None,
+            "ami_platform": None,
+            "ami_platform_details": None,
+            "ami_root_device_type": None,
+            "ami_virtualization_type": None,
+            "ami_is_public": None,
+            "ami_deprecation_time": None,
+        }
+    return {
+        "ami_owner_aws_account_id": ami.owner_aws_account_id,
+        "ami_name": _clip(ami.name, 255),
+        "ami_description": _clip(ami.description, 1024),
+        "ami_creation_date": ami.creation_date,
+        "ami_state": ami.state,
+        "ami_architecture": ami.architecture,
+        "ami_platform": ami.platform,
+        "ami_platform_details": _clip(ami.platform_details, 64),
+        "ami_root_device_type": ami.root_device_type,
+        "ami_virtualization_type": ami.virtualization_type,
+        "ami_is_public": bool(ami.is_public),
+        "ami_deprecation_time": ami.deprecation_time,
+    }
+
+
+def _enrichment_columns(
+    inst_enrichments: dict[str, EnrichmentResult] | None,
+) -> dict[str, Any]:
+    if not inst_enrichments:
+        return {}
+    cols: dict[str, Any] = {}
+    if "ssh" in inst_enrichments:
+        ssh_res = inst_enrichments["ssh"]
+        sf = ssh_res.facts or {}
+        cols.update(
+            {
+                "ssh_status": _clip(ssh_res.status, 32),
+                "ssh_user": _clip(sf.get("ssh_user"), 64),
+                "ssh_host": _clip(sf.get("ssh_host"), 45),
+                "ssh_port": sf.get("ssh_port"),
+                "ssh_os_id": _clip(sf.get("os_id"), 64),
+                "ssh_os_version": _clip(sf.get("os_version"), 64),
+                "ssh_os_pretty_name": _clip(sf.get("os_pretty_name"), 255),
+                "ssh_kernel": _clip(sf.get("kernel"), 128),
+                "ssh_hostname": _clip(sf.get("hostname"), 255),
+                "ssh_uptime_seconds": sf.get("uptime_seconds"),
+                "ssh_package_count": sf.get("package_count"),
+                "ssh_listening_port_count": sf.get("listening_port_count"),
+                "ssh_container_count": sf.get("container_count"),
+                "ssh_reboot_required": sf.get("reboot_required"),
+                "ssh_facts": ssh_res.facts,
+                "ssh_error": ssh_res.error,
+                "ssh_collected_at": datetime.now(UTC).replace(tzinfo=None, microsecond=0),
+            }
+        )
+    other = {
+        k: {"status": v.status, "facts": v.facts, "error": v.error}
+        for k, v in inst_enrichments.items()
+        if k != "ssh"
+    }
+    if other:
+        cols["extra_facts"] = other
+    return cols
+
+
+def _build_instance_cols(
     inst: InstanceRecord,
     data: Collected,
     inst_enrichments: dict[str, EnrichmentResult] | None = None,
-) -> str:
-    tinfo = data.type_info.get(inst.instance_type)
-    ami = data.amis.get(inst.image_id)
+) -> dict[str, Any]:
     (
         vol_list,
         root_vol_id,
@@ -196,18 +321,8 @@ def _load_instance(
         "instance_type": inst.instance_type,
         "instance_family": _instance_family(inst.instance_type),
         "architecture": inst.architecture,
-        "vcpu": tinfo.vcpu if tinfo else None,
         "cpu_core_count": inst.cpu_core_count,
         "cpu_threads_per_core": inst.cpu_threads_per_core,
-        "memory_mib": tinfo.memory_mib if tinfo else None,
-        "gpu_count": tinfo.gpu_count if tinfo else None,
-        "gpu_model": _clip(tinfo.gpu_model, 64) if tinfo else None,
-        "gpu_memory_mib": tinfo.gpu_memory_mib if tinfo else None,
-        "instance_storage_gib": tinfo.instance_storage_gib if tinfo else None,
-        "network_performance": _clip(tinfo.network_performance, 64) if tinfo else None,
-        "is_current_generation": tinfo.is_current_generation if tinfo else None,
-        "is_burstable": tinfo.is_burstable if tinfo else None,
-        "is_bare_metal": tinfo.is_bare_metal if tinfo else None,
         "hypervisor": _clip(inst.hypervisor, 16),
         "virtualization_type": _clip(inst.virtualization_type, 16),
         "ena_support": inst.ena_support,
@@ -217,18 +332,6 @@ def _load_instance(
         "platform": _clip(inst.platform, 32),
         "platform_details": _clip(inst.platform_details, 64),
         "image_id": inst.image_id,
-        "ami_owner_aws_account_id": ami.owner_aws_account_id if ami else None,
-        "ami_name": _clip(ami.name, 255) if ami else None,
-        "ami_description": _clip(ami.description, 1024) if ami else None,
-        "ami_creation_date": ami.creation_date if ami else None,
-        "ami_state": ami.state if ami else None,
-        "ami_architecture": ami.architecture if ami else None,
-        "ami_platform": ami.platform if ami else None,
-        "ami_platform_details": _clip(ami.platform_details, 64) if ami else None,
-        "ami_root_device_type": ami.root_device_type if ami else None,
-        "ami_virtualization_type": ami.virtualization_type if ami else None,
-        "ami_is_public": bool(ami.is_public) if ami else None,
-        "ami_deprecation_time": ami.deprecation_time if ami else None,
         "availability_zone": inst.availability_zone,
         "vpc_id": inst.vpc_id,
         "vpc_cidr": data.vpc_cidrs.get(inst.vpc_id) if inst.vpc_id else None,
@@ -264,41 +367,23 @@ def _load_instance(
         "volumes": vol_list,
         "network_interfaces": nic_list,
     }
+    cols.update(_type_columns(data.type_info.get(inst.instance_type)))
+    cols.update(_ami_columns(data.amis.get(inst.image_id)))
+    cols.update(_enrichment_columns(inst_enrichments))
+    return cols
 
-    if inst_enrichments:
-        now = datetime.now(UTC).replace(tzinfo=None, microsecond=0)
-        if "ssh" in inst_enrichments:
-            ssh_res = inst_enrichments["ssh"]
-            sf = ssh_res.facts or {}
-            cols["ssh_status"] = _clip(ssh_res.status, 32)
-            cols["ssh_user"] = _clip(sf.get("ssh_user"), 64)
-            cols["ssh_host"] = _clip(sf.get("ssh_host"), 45)
-            cols["ssh_port"] = sf.get("ssh_port")
-            cols["ssh_os_id"] = _clip(sf.get("os_id"), 64)
-            cols["ssh_os_version"] = _clip(sf.get("os_version"), 64)
-            cols["ssh_os_pretty_name"] = _clip(sf.get("os_pretty_name"), 255)
-            cols["ssh_kernel"] = _clip(sf.get("kernel"), 128)
-            cols["ssh_hostname"] = _clip(sf.get("hostname"), 255)
-            cols["ssh_uptime_seconds"] = sf.get("uptime_seconds")
-            cols["ssh_package_count"] = sf.get("package_count")
-            cols["ssh_listening_port_count"] = sf.get("listening_port_count")
-            cols["ssh_container_count"] = sf.get("container_count")
-            cols["ssh_reboot_required"] = sf.get("reboot_required")
-            cols["ssh_facts"] = ssh_res.facts
-            cols["ssh_error"] = ssh_res.error
-            cols["ssh_collected_at"] = now
-        other = {
-            k: {"status": v.status, "facts": v.facts, "error": v.error}
-            for k, v in inst_enrichments.items()
-            if k != "ssh"
-        }
-        if other:
-            cols["extra_facts"] = other
 
+def _upsert_instance(
+    db: Session,
+    aws_account_id: str,
+    region: str,
+    instance_id: str,
+    cols: dict[str, Any],
+) -> str:
     key = {
         "aws_account_id": aws_account_id,
         "region": region,
-        "instance_id": inst.instance_id,
+        "instance_id": instance_id,
     }
 
     existing = db.scalars(select(Instance).filter_by(**key)).first()

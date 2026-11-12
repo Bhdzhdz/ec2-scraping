@@ -21,7 +21,7 @@ from ec2_scraping.db import (
 EXPECTED_TABLES = {"instance"}
 
 
-def test_single_table_registered_with_innodb_utf8mb4():
+def test_single_table_registered_with_innodb_utf8mb4() -> None:
     assert set(Base.metadata.tables) == EXPECTED_TABLES
     table = Base.metadata.tables["instance"]
     assert table.dialect_options["mysql"]["engine"] == "InnoDB"
@@ -29,7 +29,7 @@ def test_single_table_registered_with_innodb_utf8mb4():
     ddl = str(CreateTable(table).compile(dialect=mysql.dialect()))
     assert "ENGINE=InnoDB" in ddl
     assert "CHARSET=utf8mb4" in ddl
-    for col in (
+    expected_cols = {
         "instance_family",
         "gpu_count",
         "ebs_total_size_gib",
@@ -38,22 +38,25 @@ def test_single_table_registered_with_innodb_utf8mb4():
         "volumes",
         "ssh_facts",
         "extra_facts",
-    ):
-        assert col in table.c
+    }
+    assert expected_cols.issubset(table.c.keys())
 
 
-def test_instance_table_indexes_and_no_foreign_keys():
+def test_instance_table_indexes_and_no_foreign_keys() -> None:
     instance_table = Base.metadata.tables["instance"]
     assert not instance_table.foreign_keys
     index_cols = {idx.name: tuple(c.name for c in idx.columns) for idx in instance_table.indexes}
-    assert index_cols["ix_instance_image"] == ("region", "image_id")
-    assert index_cols["ix_instance_vpc"] == ("region", "vpc_id")
-    assert index_cols["ix_instance_state"] == ("state",)
-    assert index_cols["ix_instance_type"] == ("instance_type",)
-    assert index_cols["ix_instance_last_seen"] == ("last_seen_at",)
+    expected = {
+        "ix_instance_image": ("region", "image_id"),
+        "ix_instance_vpc": ("region", "vpc_id"),
+        "ix_instance_state": ("state",),
+        "ix_instance_type": ("instance_type",),
+        "ix_instance_last_seen": ("last_seen_at",),
+    }
+    assert index_cols == expected
 
 
-def test_unique_constraint():
+def test_unique_constraint() -> None:
     instance_table = Base.metadata.tables["instance"]
     uqs = {
         c.name: tuple(col.name for col in c.columns)
@@ -63,7 +66,7 @@ def test_unique_constraint():
     assert uqs == {"uq_instance": ("aws_account_id", "region", "instance_id")}
 
 
-def test_model_class_instantiable():
+def test_model_class_instantiable() -> None:
     inst = Instance(
         aws_account_id="111111111111",
         region="us-east-1",
@@ -80,8 +83,7 @@ def test_model_class_instantiable():
         tags={"Name": "web"},
         ssh_facts={"kernel": "6.1"},
     )
-    assert inst.instance_id == "i-1"
-    assert inst.ssh_facts == {"kernel": "6.1"}
+    assert (inst.instance_id, inst.ssh_facts) == ("i-1", {"kernel": "6.1"})
 
 
 @pytest.mark.parametrize(
@@ -92,7 +94,7 @@ def test_model_class_instantiable():
         ("mysql+pymysql://u:p@h:3306/db", "mysql+pymysql://u:p@h:3306/db"),
     ],
 )
-def test_session_and_dsn_helpers(raw, expected):
+def test_session_and_dsn_helpers(raw: str, expected: str) -> None:
     assert normalize_dsn(raw) == expected
     engine = make_engine(raw)
     factory = make_session_factory(engine)
@@ -101,7 +103,7 @@ def test_session_and_dsn_helpers(raw, expected):
     assert factory_from_dsn.kw["bind"].url.drivername == "mysql+pymysql"
 
 
-def test_offline_alembic_upgrade_and_downgrade_sql():
+def test_offline_alembic_upgrade_and_downgrade_sql() -> None:
     buf = io.StringIO()
     with redirect_stdout(buf):
         upgrade_db("mysql://u:p@localhost:3306/inv", "head", sql=True)
