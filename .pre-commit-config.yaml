@@ -30,19 +30,12 @@ repos:
       - id: commitizen
         stages: [commit-msg]
 
-  # Heavier checks run on push only
+  # Heavier checks run on push only via the unified quiet gate script
   - repo: local
     hooks:
-      - id: ty
-        name: ty check
-        entry: uv run ty check
-        language: system
-        types: [python]
-        pass_filenames: false
-        stages: [pre-push]
-      - id: pytest
-        name: pytest
-        entry: uv run pytest
+      - id: check-all
+        name: project quality gates (ty, deptry, vulture, import-linter, pylint, xenon, radon, pytest)
+        entry: scripts/check.sh
         language: system
         types: [python]
         pass_filenames: false

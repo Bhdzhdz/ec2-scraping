@@ -22,8 +22,9 @@ venv/
 htmlcov/
 coverage.xml
 
-# IDE / OS
+# IDE / OS / Agent scratch
 .idea/
 .vscode/
 .DS_Store
 *.swp
+NOTES.md

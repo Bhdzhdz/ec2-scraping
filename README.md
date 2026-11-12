@@ -51,14 +51,29 @@ uv run ec2-scrape export -o inventory.csv
 ## Development
 
 ```bash
-uv sync                                      # install dependencies
-uv run pre-commit install                    # install commit + pre-push hooks
-uv run ruff check --fix . && uv run ruff format .
-uv run ty check
-uv run pytest -q -x --tb=short
+uv sync                              # install deps
+uv run pre-commit install            # hooks (commit + pre-push)
+./scripts/map.sh                     # compact AST map (files, line ranges, typed signatures)
+./scripts/check.sh --fix src/file.py # fast single-file gate + matching test
+./scripts/check.sh --fix             # format/fix + run all 10 repo quality gates quietly
 ```
 
-Pre-commit runs ruff + hygiene checks; pre-push runs `ty` and `pytest`.
+Individual checks:
+
+```bash
+uv run ruff check . && uv run ruff format .
+uv run ty check
+uv run deptry .                        # unused / missing / misplaced deps
+uv run vulture                         # dead / unused code
+uv run lint-imports                    # module import boundaries
+uv run pylint                          # duplicate-code check (R0801)
+uv run xenon -b B -m A -a A src tests  # cyclomatic complexity gates
+uv run radon mi -n B -s src tests      # maintainability index check (rank A required)
+uv run pytest -q path::test_name       # fast single test (no coverage table)
+uv run pytest --cov                    # full test suite + >=80% branch coverage
+```
+
+Pre-commit runs ruff + hygiene checks; pre-push and CI run `./scripts/check.sh`.
 
 ## Database Schema & Migrations
 

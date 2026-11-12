@@ -1,0 +1,5 @@
+# Exclude agent workflows, templates, and lockfiles from default rg/fd searches to save tokens
+.agents/
+.specify/
+.copier-answers.yml
+uv.lock
