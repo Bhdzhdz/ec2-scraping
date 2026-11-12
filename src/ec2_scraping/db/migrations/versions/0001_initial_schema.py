@@ -5,7 +5,7 @@ Revises: None
 Create Date: 2026-10-16 00:00:00
 """
 
-from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import sqlalchemy as sa
 from alembic import op
@@ -17,6 +17,9 @@ from ec2_scraping.db.models import (
     INSTANCE_STATE_VALUES,
     MONITORING_VALUES,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 revision: str = "0001_initial_schema"
 down_revision: str | Sequence[str] | None = None

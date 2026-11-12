@@ -19,7 +19,7 @@ class ConfigError(Exception):
     """Missing or invalid configuration."""
 
 
-def parse_dsn(dsn: str) -> dict:
+def parse_dsn(dsn: str) -> dict[str, str | int]:
     """Validate and parse a MariaDB/MySQL or SQLite DSN."""
     if not dsn:
         raise ConfigError(

@@ -1,6 +1,6 @@
 """SQLAlchemy 2.0 Declarative ORM model for the wide analytics EC2 instance inventory schema."""
 
-from datetime import datetime
+from datetime import datetime  # noqa: TC003
 from typing import Any
 
 from sqlalchemy import JSON, Boolean, DateTime, Enum, Index, String, Text, UniqueConstraint, text

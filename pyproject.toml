@@ -3,7 +3,7 @@ name = "ec2-scraping"
 version = "0.1.0"
 description = "Geenerate an inventory of the ec2 instances on an aws account and get metadata from them "
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 authors = [{ name = "Bernardo Hernandez Hernandez", email = "bhdzhdz@gmail.com" }]
 dependencies = [
     "alembic>=1.13",
@@ -42,7 +42,7 @@ dev = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py314"
 src = ["src", "tests"]
 output-format = "concise"
 

@@ -1,7 +1,5 @@
 """SSH probe script and output parser for OS/system telemetry."""
 
-from __future__ import annotations
-
 from typing import Any
 
 PROBE_SCRIPT = r"""

@@ -1,7 +1,5 @@
 """Fixtures that apply Alembic migrations to a disposable MariaDB/MySQL database."""
 
-from __future__ import annotations
-
 import os
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse

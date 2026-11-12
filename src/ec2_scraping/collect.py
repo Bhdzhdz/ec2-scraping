@@ -1,8 +1,7 @@
 """Paginated, read-only EC2 Describe* collection mapped to plain dataclasses."""
 
-from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from botocore.exceptions import ClientError
 
@@ -15,6 +14,11 @@ from ec2_scraping.models import (
     VolumeAttachment,
     VolumeInfo,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Iterator
+
+type RawDict = dict[str, Any]
 
 BATCH = 100
 _TOLERATED = {
@@ -38,17 +42,17 @@ def _naive_utc(value: datetime | str | None) -> datetime | None:
     return value.replace(microsecond=0)
 
 
-def _tags(items: list[dict] | None) -> dict[str, str]:
+def _tags(items: list[RawDict] | None) -> dict[str, str]:
     return {t["Key"]: t.get("Value", "") for t in items or []}
 
 
-def _batches(values: Iterable[str], size: int = BATCH) -> Iterator[list[str]]:
+def _batches[T: str](values: Iterable[T], size: int = BATCH) -> Iterator[list[T]]:
     ordered = sorted(set(values))
     for i in range(0, len(ordered), size):
         yield ordered[i : i + size]
 
 
-def _map_nics(raw_nics: list[dict]) -> list[NetworkInterfaceRecord]:
+def _map_nics(raw_nics: list[RawDict]) -> list[NetworkInterfaceRecord]:
     return [
         NetworkInterfaceRecord(
             eni_id=n["NetworkInterfaceId"],
@@ -64,7 +68,7 @@ def _map_nics(raw_nics: list[dict]) -> list[NetworkInterfaceRecord]:
     ]
 
 
-def _map_volumes(raw_bdms: list[dict]) -> list[VolumeAttachment]:
+def _map_volumes(raw_bdms: list[RawDict]) -> list[VolumeAttachment]:
     return [
         VolumeAttachment(
             device_name=b["DeviceName"],
@@ -76,7 +80,7 @@ def _map_volumes(raw_bdms: list[dict]) -> list[VolumeAttachment]:
     ]
 
 
-def _first_ipv6(raw: dict, nics: list[NetworkInterfaceRecord]) -> str | None:
+def _first_ipv6(raw: RawDict, nics: list[NetworkInterfaceRecord]) -> str | None:
     if ipv6 := raw.get("Ipv6Address"):
         return ipv6
     for nic in nics:
@@ -89,17 +93,17 @@ def _opt_str(value: str | None, default: str | None = None) -> str | None:
     return value or default
 
 
-def _sub_get(raw: dict, key: str, subkey: str, default: Any = None) -> Any:
+def _sub_get(raw: RawDict, key: str, subkey: str, default: Any = None) -> Any:
     sub = raw.get(key)
     return sub.get(subkey, default) if sub else default
 
 
-def _monitoring_state(raw: dict) -> str:
+def _monitoring_state(raw: RawDict) -> str:
     state = _sub_get(raw, "Monitoring", "State", "disabled")
     return state if state in ("disabled", "enabled", "pending") else "disabled"
 
 
-def map_instance(raw: dict) -> InstanceRecord:
+def map_instance(raw: RawDict) -> InstanceRecord:
     nics = _map_nics(raw.get("NetworkInterfaces", []))
     volumes = _map_volumes(raw.get("BlockDeviceMappings", []))
     tags = _tags(raw.get("Tags"))
@@ -164,7 +168,7 @@ def map_instance(raw: dict) -> InstanceRecord:
     )
 
 
-def map_ami(raw: dict) -> AmiRecord:
+def map_ami(raw: RawDict) -> AmiRecord:
     return AmiRecord(
         image_id=raw["ImageId"],
         owner_aws_account_id=raw["OwnerId"],
@@ -182,7 +186,7 @@ def map_ami(raw: dict) -> AmiRecord:
     )
 
 
-def _gpu_summary(gpu_info: dict | None) -> tuple[int | None, str | None, int | None]:
+def _gpu_summary(gpu_info: RawDict | None) -> tuple[int | None, str | None, int | None]:
     if not gpu_info:
         return None, None, None
     gpus = gpu_info.get("Gpus") or []
@@ -196,7 +200,7 @@ def _gpu_summary(gpu_info: dict | None) -> tuple[int | None, str | None, int | N
     return gpu_count, gpu_model, gpu_info.get("TotalGpuMemoryInMiB")
 
 
-def map_type_info(raw: dict) -> TypeInfo:
+def map_type_info(raw: RawDict) -> TypeInfo:
     archs = (raw.get("ProcessorInfo") or {}).get("SupportedArchitectures") or [None]
     gpu_count, gpu_model, gpu_mem = _gpu_summary(raw.get("GpuInfo"))
     storage_gib = (raw.get("InstanceStorageInfo") or {}).get("TotalSizeInGB")
@@ -215,7 +219,7 @@ def map_type_info(raw: dict) -> TypeInfo:
     )
 
 
-def map_volume(raw: dict) -> VolumeInfo:
+def map_volume(raw: RawDict) -> VolumeInfo:
     return VolumeInfo(
         volume_id=raw["VolumeId"],
         size_gib=raw.get("Size"),
@@ -236,11 +240,11 @@ def _fetch_batch(
     param_name: str,
     result_key: str,
     items: list[str],
-) -> list[dict]:
+) -> list[RawDict]:
     """Describe a batch of resource IDs; fall back to single-item calls on tolerated errors."""
 
-    def _call(ids: list[str]) -> list[dict]:
-        out: list[dict] = []
+    def _call(ids: list[str]) -> list[RawDict]:
+        out: list[RawDict] = []
         for page in ec2.get_paginator(operation).paginate(**{param_name: ids}):
             out.extend(page.get(result_key, []))
         return out
@@ -250,7 +254,7 @@ def _fetch_batch(
     except ClientError as exc:
         if _error_code(exc) not in _TOLERATED:
             raise
-    found: list[dict] = []
+    found: list[RawDict] = []
     for item in items:
         try:
             found.extend(_call([item]))
@@ -260,14 +264,14 @@ def _fetch_batch(
     return found
 
 
-def _fetch_images(ec2: Any, image_ids: list[str]) -> list[dict]:
+def _fetch_images(ec2: Any, image_ids: list[str]) -> list[RawDict]:
     """Describe referenced AMIs; tolerate ones that are missing or not visible."""
     try:
         return ec2.describe_images(ImageIds=image_ids).get("Images", [])
     except ClientError as exc:
         if _error_code(exc) not in _TOLERATED:
             raise
-    found: list[dict] = []
+    found: list[RawDict] = []
     for image_id in image_ids:
         try:
             found.extend(ec2.describe_images(ImageIds=[image_id]).get("Images", []))
@@ -283,7 +287,7 @@ def _collect_all_batches(
     param_name: str,
     result_key: str,
     ids: Iterable[str],
-) -> Iterator[dict]:
+) -> Iterator[RawDict]:
     for batch in _batches(ids):
         yield from _fetch_batch(ec2, operation, param_name, result_key, batch)
 

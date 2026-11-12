@@ -1,7 +1,5 @@
 """Region resolution, loader, runner, enricher, and CLI tests."""
 
-from __future__ import annotations
-
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock

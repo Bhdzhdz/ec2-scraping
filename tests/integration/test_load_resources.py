@@ -1,7 +1,5 @@
 """Single-table instance upserts: analytics attributes, JSON, enrichments, idempotency."""
 
-from __future__ import annotations
-
 import dataclasses
 import json
 from typing import TYPE_CHECKING, Any

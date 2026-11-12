@@ -1,7 +1,5 @@
 """Unit tests for inventory summary and CSV export (`ec2_scraping.report` and CLI commands)."""
 
-from __future__ import annotations
-
 import csv
 import io
 import json

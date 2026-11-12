@@ -5,12 +5,14 @@ import json
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import IO
+from typing import IO, TYPE_CHECKING
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
 
 from ec2_scraping.db.models import Instance
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
 
 INSTANCE_COLUMNS: tuple[str, ...] = tuple(c.name for c in Instance.__table__.columns)
 

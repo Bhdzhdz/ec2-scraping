@@ -1,10 +1,8 @@
 """Scrape lifecycle with per-combination isolation, pluggable enrichers, and atomic loads."""
 
-from __future__ import annotations
-
 import sys
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Unpack
 
 from botocore.exceptions import ClientError, EndpointConnectionError
 
@@ -19,15 +17,19 @@ from ec2_scraping.models import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
-    from typing import IO
 
     from sqlalchemy.orm import Session
 
     from ec2_scraping.models import (
         Collected,
+        ComboStatus,
+        EnrichmentsByInstance,
         InstanceEnricher,
         InstanceRecord,
+        RunOptions,
+        RunStatus,
     )
+
 
 # Errors meaning "this region is not usable for the account" (stored as skipped).
 _DISABLED_CODES = {"AuthFailure", "OptInRequired"}
@@ -42,7 +44,7 @@ class _EnrichJob:
     batch_kwargs: dict[str, Any]
 
 
-def _classify(exc: Exception) -> str:
+def _classify(exc: Exception) -> ComboStatus:
     if isinstance(exc, EndpointConnectionError):
         return "skipped"
     if (
@@ -89,7 +91,7 @@ def _ssh_targets_and_users(
 def _store_batch_results(
     name: str,
     batch_res: dict[str, EnrichmentResult],
-    results: dict[str, dict[str, EnrichmentResult]],
+    results: EnrichmentsByInstance,
 ) -> None:
     for inst_id, res in batch_res.items():
         if inst_id in results:
@@ -100,7 +102,7 @@ def _store_batch_failure(
     name: str,
     targets: list[InstanceRecord],
     err: str,
-    results: dict[str, dict[str, EnrichmentResult]],
+    results: EnrichmentsByInstance,
 ) -> None:
     for inst in targets:
         results[inst.instance_id][name] = EnrichmentResult(status="failed", error=err)
@@ -109,7 +111,7 @@ def _store_batch_failure(
 def _run_batch_enricher(
     enricher: InstanceEnricher,
     job: _EnrichJob,
-    results: dict[str, dict[str, EnrichmentResult]],
+    results: EnrichmentsByInstance,
 ) -> bool:
     batch_fn = getattr(enricher, "enrich_batch", None)
     if not callable(batch_fn):
@@ -127,7 +129,7 @@ def _run_batch_enricher(
 def _run_single_enricher(
     enricher: InstanceEnricher,
     job: _EnrichJob,
-    results: dict[str, dict[str, EnrichmentResult]],
+    results: EnrichmentsByInstance,
 ) -> None:
     for inst in job.targets:
         try:
@@ -169,12 +171,10 @@ def _run_enrichers(
     region: str,
     data: Collected,
     enrichers: Sequence[InstanceEnricher],
-) -> dict[str, dict[str, EnrichmentResult]]:
+) -> EnrichmentsByInstance:
     if not enrichers or not data.instances:
         return {}
-    results: dict[str, dict[str, EnrichmentResult]] = {
-        inst.instance_id: {} for inst in data.instances
-    }
+    results: EnrichmentsByInstance = {inst.instance_id: {} for inst in data.instances}
     for enricher in enrichers:
         job = _build_enrich_job(db, aws_account_id, region, data, enricher)
         if job and not _run_batch_enricher(enricher, job, results):
@@ -203,7 +203,7 @@ def _scrape_combo(
         return result
 
 
-def _run_status(combos: list[ComboResult]) -> str:
+def _run_status(combos: list[ComboResult]) -> RunStatus:
     ok = sum(c.status == "succeeded" for c in combos)
     if combos and ok == len(combos):
         return "succeeded"
@@ -214,7 +214,7 @@ def _resolve_profile_targets(
     profile: str,
     regions: list[str] | None,
     all_regions: bool,
-    open_session: Callable[..., Any],
+    open_session: Callable[[str], Any],
 ) -> tuple[Any, list[str], ComboResult | None]:
     try:
         ps = open_session(profile)
@@ -234,13 +234,13 @@ def run(
     profiles: list[str],
     regions: list[str] | None = None,
     all_regions: bool = False,
-    **opts: Any,
+    **opts: Unpack[RunOptions],
 ) -> RunResult:
     """Scrape every profile/region combination into the `instance` table."""
-    open_session: Callable[..., Any] = opts.get("open_session", session.open_session)
-    collect_fn: Callable[..., Collected] = opts.get("collect_fn", collect_mod.collect)
-    enrichers: Sequence[InstanceEnricher] = opts.get("enrichers", ())
-    progress: IO[str] = opts.get("progress", sys.stderr)
+    open_session = opts.get("open_session", session.open_session)
+    collect_fn = opts.get("collect_fn", collect_mod.collect)
+    enrichers = opts.get("enrichers", ())
+    progress = opts.get("progress", sys.stderr)
     result = RunResult("failed")
     for profile in profiles:
         ps, targets, err_combo = _resolve_profile_targets(

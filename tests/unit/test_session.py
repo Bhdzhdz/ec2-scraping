@@ -1,7 +1,5 @@
 """SSO session handling: account resolution and expired-login mapping."""
 
-from __future__ import annotations
-
 from typing import TYPE_CHECKING, Any
 
 import pytest

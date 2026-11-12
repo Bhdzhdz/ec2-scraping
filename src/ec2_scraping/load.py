@@ -1,7 +1,5 @@
 """Transactional upserts of collected instances and enrichments into the single-table schema."""
 
-from __future__ import annotations
-
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -18,6 +16,7 @@ if TYPE_CHECKING:
         Collected,
         EnrichmentResult,
         InstanceRecord,
+        LoadOutcome,
         TypeInfo,
         VolumeAttachment,
         VolumeInfo,
@@ -379,7 +378,7 @@ def _upsert_instance(
     region: str,
     instance_id: str,
     cols: dict[str, Any],
-) -> str:
+) -> LoadOutcome:
     key = {
         "aws_account_id": aws_account_id,
         "region": region,

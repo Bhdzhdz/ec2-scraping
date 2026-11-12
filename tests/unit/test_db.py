@@ -1,7 +1,5 @@
 """DSN parsing and SQLite fallback when MariaDB is unset or unreachable."""
 
-from __future__ import annotations
-
 from datetime import datetime
 from typing import TYPE_CHECKING
 

@@ -1,7 +1,5 @@
 """`ec2-scrape` command line interface."""
 
-from __future__ import annotations
-
 import argparse
 import os
 import signal
@@ -9,7 +7,7 @@ import sys
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, NoReturn, override
 
 from ec2_scraping import db, report, runner, session, ssh
 
@@ -54,6 +52,7 @@ def _env_float(name: str, default: float) -> float:
 
 
 class _Parser(argparse.ArgumentParser):
+    @override
     def error(self, message: str) -> NoReturn:  # usage errors use exit code 64 per the contract
         self.print_usage(sys.stderr)
         self.exit(EXIT_USAGE, f"{self.prog}: error: {message}\n")
@@ -228,7 +227,7 @@ def _build_enrichers(args: argparse.Namespace) -> list[InstanceEnricher]:
 
 def _run_once(
     args: argparse.Namespace,
-    open_session: Callable[..., Any],
+    open_session: Callable[[str], session.ProfileSession],
     enrichers: list[InstanceEnricher],
 ) -> RunResult:
     conn = db.connect(args.dsn)
@@ -247,7 +246,7 @@ def _run_once(
 
 def _cmd_run(
     args: argparse.Namespace,
-    open_session: Callable[..., Any] = session.open_session,
+    open_session: Callable[[str], session.ProfileSession] = session.open_session,
 ) -> int:
     if args.all_regions and args.region:
         _emit("ec2-scrape: error: --all-regions cannot be combined with --region", err=True)
@@ -273,7 +272,7 @@ def _validate_daemon_args(args: argparse.Namespace) -> bool:
 def _run_daemon_cycle(
     cycle: int,
     args: argparse.Namespace,
-    open_session: Callable[..., Any],
+    open_session: Callable[[str], session.ProfileSession],
     enrichers: list[InstanceEnricher],
 ) -> int:
     ts = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -289,7 +288,7 @@ def _run_daemon_cycle(
 
 def _cmd_daemon(
     args: argparse.Namespace,
-    open_session: Callable[..., Any] = session.open_session,
+    open_session: Callable[[str], session.ProfileSession] = session.open_session,
     stop_event: threading.Event | None = None,
 ) -> int:
     if not _validate_daemon_args(args):

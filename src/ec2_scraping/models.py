@@ -1,8 +1,19 @@
 """Plain data holders passed between collection, loading, enrichment and the runner."""
 
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, ReadOnly, TypedDict
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+    from datetime import datetime
+    from pathlib import Path
+    from typing import IO
+
+type EnrichmentStatus = Literal["succeeded", "failed", "skipped"]
+type ComboStatus = Literal["succeeded", "failed", "skipped"]
+type RunStatus = Literal["succeeded", "partial", "failed"]
+type LoadOutcome = Literal["created", "updated", "unchanged"]
+type EnrichmentsByInstance = dict[str, dict[str, EnrichmentResult]]
 
 
 @dataclass(frozen=True)
@@ -139,7 +150,7 @@ class Collected:
 class EnrichmentResult:
     """Payload returned by an instance enricher (e.g. SSH collector)."""
 
-    status: str  # succeeded | failed | skipped
+    status: EnrichmentStatus
     facts: dict[str, Any] | None = None
     error: str | None = None
 
@@ -147,11 +158,32 @@ class EnrichmentResult:
 class InstanceEnricher(Protocol):
     """Strategy interface for post-AWS instance data collection (e.g. SSH, SSM)."""
 
-    name: str  # e.g. "ssh" or custom key stored under extra_facts[name]
+    @property
+    def name(self) -> str: ...
 
     def enrich(
-        self, aws_account_id: str, region: str, instance: InstanceRecord
+        self, aws_account_id: str, region: str, instance: InstanceRecord, /
     ) -> EnrichmentResult: ...
+
+
+class SshCollectorOptions(TypedDict, total=False):
+    users: ReadOnly[Sequence[str] | None]
+    key_files: ReadOnly[Sequence[str | Path] | None]
+    key_dir: ReadOnly[str | Path | None]
+    port: ReadOnly[int]
+    connect_timeout: ReadOnly[float]
+    command_timeout: ReadOnly[float]
+    concurrency: ReadOnly[int]
+    prefer_public_ip: ReadOnly[bool]
+    only_unaccessed: ReadOnly[bool]
+    connect_fn: ReadOnly[Callable[..., Any]]
+
+
+class RunOptions(TypedDict, total=False):
+    open_session: ReadOnly[Callable[[str], Any]]
+    collect_fn: ReadOnly[Callable[..., Collected]]
+    enrichers: ReadOnly[Sequence[InstanceEnricher]]
+    progress: ReadOnly[IO[str]]
 
 
 @dataclass
@@ -160,7 +192,7 @@ class Counts:
     updated: int = 0
     unchanged: int = 0
 
-    def add(self, outcome: str) -> None:
+    def add(self, outcome: LoadOutcome) -> None:
         setattr(self, outcome, getattr(self, outcome) + 1)
 
 
@@ -168,12 +200,12 @@ class Counts:
 class ComboResult:
     profile: str
     region: str | None
-    status: str  # succeeded | failed | skipped
+    status: ComboStatus
     error: str | None = None
     instances: Counts = field(default_factory=Counts)
 
 
 @dataclass
 class RunResult:
-    status: str  # succeeded | partial | failed
+    status: RunStatus
     combos: list[ComboResult] = field(default_factory=list)

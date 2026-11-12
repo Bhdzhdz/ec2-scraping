@@ -1,10 +1,8 @@
 """Async SSH collector: probes common usernames and gathers OS/system facts."""
 
-from __future__ import annotations
-
 import asyncio
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Unpack
 
 import asyncssh
 
@@ -14,7 +12,10 @@ from ec2_scraping.ssh_probe import PROBE_SCRIPT, parse_probe_output
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
 
-    from ec2_scraping.models import InstanceRecord
+    from ec2_scraping.models import InstanceRecord, SshCollectorOptions
+
+type ClientKey = asyncssh.SSHKey | str
+
 
 __all__ = [
     "DEFAULT_KEY_NAMES",
@@ -147,7 +148,7 @@ class SshCollector:
 
     name = "ssh"
 
-    def __init__(self, **opts: Any) -> None:
+    def __init__(self, **opts: Unpack[SshCollectorOptions]) -> None:
         self.users = tuple(opts.get("users") or DEFAULT_SSH_USERS)
         self.key_files = tuple(opts.get("key_files") or ())
         self.key_dir: str | Path | None = opts.get("key_dir")
@@ -160,7 +161,7 @@ class SshCollector:
         self.connect_fn: Callable[..., Any] = opts.get("connect_fn", asyncssh.connect)
         self._file_exists_cache: dict[str, bool] = {}
         self._dir_files_cache: dict[str, list[str]] = {}
-        self._parsed_key_cache: dict[str, asyncssh.SSHKey | str] = {}
+        self._parsed_key_cache: dict[str, ClientKey] = {}
 
     def _is_file_cached(self, p: Path) -> tuple[str, bool]:
         exp = p.expanduser()
@@ -180,11 +181,11 @@ class SshCollector:
             self._dir_files_cache[key] = files
         return self._dir_files_cache[key]
 
-    def _load_key_cached(self, path: str) -> asyncssh.SSHKey | str:
+    def _load_key_cached(self, path: str) -> ClientKey:
         if path not in self._parsed_key_cache:
             try:
                 self._parsed_key_cache[path] = asyncssh.read_private_key(path)
-            except (asyncssh.KeyImportError, OSError):
+            except asyncssh.KeyImportError, OSError:
                 self._parsed_key_cache[path] = path
         return self._parsed_key_cache[path]
 
@@ -200,7 +201,7 @@ class SshCollector:
         paths.extend(ssh_dir / name for name in DEFAULT_KEY_NAMES)
         return paths
 
-    def _resolve_cached_client_keys(self, inst: InstanceRecord) -> Sequence[asyncssh.SSHKey | str]:
+    def _resolve_cached_client_keys(self, inst: InstanceRecord) -> Sequence[ClientKey]:
         found: list[str] = []
         seen: set[str] = set()
         for p in self._candidate_key_paths(inst):
@@ -225,7 +226,7 @@ class SshCollector:
         )
 
     def _connect_kwargs(
-        self, host: str, user: str, client_keys: Sequence[asyncssh.SSHKey | str]
+        self, host: str, user: str, client_keys: Sequence[ClientKey]
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "host": host,
@@ -244,7 +245,7 @@ class SshCollector:
         self,
         host: str,
         user: str,
-        client_keys: Sequence[asyncssh.SSHKey | str],
+        client_keys: Sequence[ClientKey],
     ) -> tuple[dict[str, Any] | None, str | None]:
         try:
             async with self.connect_fn(**self._connect_kwargs(host, user, client_keys)) as conn:
@@ -263,7 +264,7 @@ class SshCollector:
         self,
         host: str,
         candidates: list[str],
-        client_keys: Sequence[asyncssh.SSHKey | str],
+        client_keys: Sequence[ClientKey],
         on_success: Callable[[str], None] | None = None,
     ) -> EnrichmentResult:
         for idx, user in enumerate(candidates):

@@ -1,7 +1,5 @@
 """Unit tests for the async SSH collector: user rotation, key resolution, and probe parsing."""
 
-from __future__ import annotations
-
 from contextlib import asynccontextmanager
 from datetime import datetime
 from types import SimpleNamespace
