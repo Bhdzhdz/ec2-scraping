@@ -319,10 +319,9 @@ def test_ssh_only_unaccessed_skips_succeeded_and_preserves_previous_data(
     db = MagicMock()
 
     def fake_scalars(stmt: Any) -> SimpleNamespace:
-        for inst_id, obj in rows_by_id.items():
-            if inst_id in str(stmt.compile(compile_kwargs={"literal_binds": True})):
-                return SimpleNamespace(first=lambda obj=obj: obj)
-        return SimpleNamespace(first=lambda: None)
+        sql = str(stmt.compile(compile_kwargs={"literal_binds": True}))
+        matched = [obj for inst_id, obj in rows_by_id.items() if inst_id in sql]
+        return SimpleNamespace(all=lambda: matched)
 
     db.scalars.side_effect = fake_scalars
     db.add.side_effect = lambda obj: rows_by_id.setdefault(obj.instance_id, obj)

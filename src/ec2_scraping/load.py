@@ -1,6 +1,7 @@
 """Transactional upserts of collected instances and enrichments into the single-table schema."""
 
 from datetime import UTC, datetime
+from itertools import batched
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import func, select
@@ -9,6 +10,8 @@ from ec2_scraping.db.models import Instance
 from ec2_scraping.models import Counts
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Iterator
+
     from sqlalchemy.orm import Session
 
     from ec2_scraping.models import (
@@ -21,6 +24,13 @@ if TYPE_CHECKING:
         VolumeAttachment,
         VolumeInfo,
     )
+
+IN_CHUNK_SIZE = 500
+
+
+def _chunks[T](values: Iterable[T], size: int = IN_CHUNK_SIZE) -> Iterator[tuple[T, ...]]:
+    """Yield non-empty deduplicated chunks of at most `size` items for SQL `IN` clauses."""
+    return batched(dict.fromkeys(values), size, strict=False)
 
 
 def _clip(value: str | None, size: int) -> str | None:
@@ -41,43 +51,64 @@ def get_accessed_ssh_instance_ids(
     db: Session, aws_account_id: str, region: str, instance_ids: list[str]
 ) -> set[str]:
     """Return instance_ids in (account, region) that already have ssh_status == 'succeeded'."""
-    if not instance_ids:
-        return set()
-    stmt = select(Instance.instance_id).where(
-        Instance.aws_account_id == aws_account_id,
-        Instance.region == region,
-        Instance.instance_id.in_(instance_ids),
-        Instance.ssh_status == "succeeded",
-    )
-    return set(db.scalars(stmt).all())
+    accessed: set[str] = set()
+    for chunk in _chunks(instance_ids):
+        stmt = select(Instance.instance_id).where(
+            Instance.aws_account_id == aws_account_id,
+            Instance.region == region,
+            Instance.instance_id.in_(chunk),
+            Instance.ssh_status == "succeeded",
+        )
+        accessed.update(db.scalars(stmt).all())
+    return accessed
 
 
 def get_known_ssh_users(
     db: Session, aws_account_id: str, region: str, instance_ids: list[str]
 ) -> dict[str, str]:
     """Return {instance_id: ssh_user} for instances in (account, region) with a known ssh_user."""
-    if not instance_ids:
-        return {}
-    stmt = select(Instance.instance_id, Instance.ssh_user).where(
-        Instance.aws_account_id == aws_account_id,
-        Instance.region == region,
-        Instance.instance_id.in_(instance_ids),
-        Instance.ssh_status == "succeeded",
-        Instance.ssh_user.is_not(None),
-    )
-    return {inst_id: user for inst_id, user in db.execute(stmt).all() if user}
+    known: dict[str, str] = {}
+    for chunk in _chunks(instance_ids):
+        stmt = select(Instance.instance_id, Instance.ssh_user).where(
+            Instance.aws_account_id == aws_account_id,
+            Instance.region == region,
+            Instance.instance_id.in_(chunk),
+            Instance.ssh_status == "succeeded",
+            Instance.ssh_user.is_not(None),
+        )
+        known.update({inst_id: user for inst_id, user in db.execute(stmt).all() if user})
+    return known
 
 
 def get_known_ami_ssh_users(db: Session, image_ids: list[str]) -> dict[str, str]:
     """Return {image_id: ssh_user} for AMIs that previously succeeded over SSH."""
-    if not image_ids:
-        return {}
-    stmt = select(Instance.image_id, Instance.ssh_user).where(
-        Instance.image_id.in_(image_ids),
-        Instance.ssh_status == "succeeded",
-        Instance.ssh_user.is_not(None),
-    )
-    return {img_id: user for img_id, user in db.execute(stmt).all() if img_id and user}
+    known: dict[str, str] = {}
+    for chunk in _chunks(image_ids):
+        stmt = select(Instance.image_id, Instance.ssh_user).where(
+            Instance.image_id.in_(chunk),
+            Instance.ssh_status == "succeeded",
+            Instance.ssh_user.is_not(None),
+        )
+        known.update({img_id: user for img_id, user in db.execute(stmt).all() if img_id and user})
+    return known
+
+
+def _prefetch_existing_instances(
+    db: Session,
+    aws_account_id: str,
+    region: str,
+    instance_ids: Iterable[str],
+) -> dict[str, Instance]:
+    existing: dict[str, Instance] = {}
+    for chunk in _chunks(instance_ids):
+        stmt = select(Instance).where(
+            Instance.aws_account_id == aws_account_id,
+            Instance.region == region,
+            Instance.instance_id.in_(chunk),
+        )
+        for row in db.scalars(stmt).all():
+            existing[row.instance_id] = row
+    return existing
 
 
 def load_instances(
@@ -89,10 +120,28 @@ def load_instances(
 ) -> Counts:
     """Upsert all collected instances for an (account, region) into the `instance` table."""
     counts = Counts()
+    if not data.instances:
+        return counts
+    existing_by_id = _prefetch_existing_instances(
+        db, aws_account_id, region, (inst.instance_id for inst in data.instances)
+    )
     for inst in data.instances:
         inst_enrichments = (enrichments or {}).get(inst.instance_id)
         cols = _build_instance_cols(inst, data, inst_enrichments)
-        counts.add(_upsert_instance(db, aws_account_id, region, inst.instance_id, cols))
+        existing = existing_by_id.get(inst.instance_id)
+        if existing is None:
+            row = Instance(
+                aws_account_id=aws_account_id,
+                region=region,
+                instance_id=inst.instance_id,
+                **cols,
+            )
+            db.add(row)
+            existing_by_id[inst.instance_id] = row
+            counts.add("created")
+        else:
+            counts.add(_update_existing_instance(existing, cols))
+    db.flush()
     return counts
 
 
@@ -372,29 +421,10 @@ def _build_instance_cols(
     return cols
 
 
-def _upsert_instance(
-    db: Session,
-    aws_account_id: str,
-    region: str,
-    instance_id: str,
-    cols: dict[str, Any],
-) -> LoadOutcome:
-    key = {
-        "aws_account_id": aws_account_id,
-        "region": region,
-        "instance_id": instance_id,
-    }
-
-    existing = db.scalars(select(Instance).filter_by(**key)).first()
-    if existing is None:
-        db.add(Instance(**key, **cols))
-        db.flush()
-        return "created"
-
+def _update_existing_instance(existing: Instance, cols: dict[str, Any]) -> LoadOutcome:
     changed = any(getattr(existing, c) != v for c, v in cols.items())
     existing.last_seen_at = func.now()  # type: ignore[assignment]
     if changed:
         for c, v in cols.items():
             setattr(existing, c, v)
-    db.flush()
     return "updated" if changed else "unchanged"

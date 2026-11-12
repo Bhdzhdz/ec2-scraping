@@ -222,8 +222,8 @@ def test_load_instances_enrichers_runner_and_cli_summary(
     stored: list[Instance] = []
 
     class FakeScalars:
-        def first(self) -> Instance | None:
-            return stored[0] if stored else None
+        def all(self) -> list[Instance]:
+            return list(stored)
 
     db = MagicMock()
     db.scalars.side_effect = lambda _: FakeScalars()
@@ -259,3 +259,46 @@ def test_load_instances_enrichers_runner_and_cli_summary(
     assert (
         cli.main(["run", "--profile", "ok", "--region", "us-east-1", "--dsn", "mysql://u@h/d"]) == 1
     )
+
+
+def test_empty_inputs_and_chunked_accessed_ids() -> None:
+    inst_ids = [f"i-{n}" for n in range(1200)] + ["i-0"]
+    db = MagicMock()
+    assert load.get_accessed_ssh_instance_ids(db, "111111111111", "us-east-1", []) == set()
+    assert load.get_known_ssh_users(db, "111111111111", "us-east-1", []) == {}
+    assert load.get_known_ami_ssh_users(db, []) == {}
+    assert load.load_instances(db, "111111111111", "us-east-1", Collected()).created == 0
+    assert (db.scalars.call_count, db.execute.call_count) == (0, 0)
+
+    db.scalars.side_effect = [
+        MagicMock(all=lambda: ["i-0", "i-499"]),
+        MagicMock(all=lambda: ["i-500"]),
+        MagicMock(all=lambda: ["i-1199"]),
+    ]
+    accessed = load.get_accessed_ssh_instance_ids(db, "111111111111", "us-east-1", inst_ids)
+    assert accessed == {"i-0", "i-499", "i-500", "i-1199"}
+    assert db.scalars.call_count == 3
+
+
+def test_chunked_known_ssh_users_and_ami_users() -> None:
+    inst_ids = [f"i-{n}" for n in range(1200)] + ["i-0"]
+    img_ids = [f"ami-{n}" for n in range(1200)] + ["ami-0"]
+    db = MagicMock()
+    db.execute.side_effect = [
+        MagicMock(all=lambda: [("i-0", "ubuntu"), ("i-1", "")]),
+        MagicMock(all=lambda: [("i-500", "ec2-user")]),
+        MagicMock(all=lambda: [("i-1199", "admin")]),
+    ]
+    users = load.get_known_ssh_users(db, "111111111111", "us-east-1", inst_ids)
+    assert users == {"i-0": "ubuntu", "i-500": "ec2-user", "i-1199": "admin"}
+    assert db.execute.call_count == 3
+
+    db.execute.reset_mock()
+    db.execute.side_effect = [
+        MagicMock(all=lambda: [("ami-0", "ubuntu"), (None, "root")]),
+        MagicMock(all=lambda: [("ami-500", "ec2-user")]),
+        MagicMock(all=lambda: [("ami-1199", "debian")]),
+    ]
+    ami_users = load.get_known_ami_ssh_users(db, img_ids)
+    assert ami_users == {"ami-0": "ubuntu", "ami-500": "ec2-user", "ami-1199": "debian"}
+    assert db.execute.call_count == 3
