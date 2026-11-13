@@ -55,7 +55,7 @@ uv sync                              # install deps
 uv run pre-commit install            # hooks (commit + pre-push)
 ./scripts/map.sh                     # compact AST map (files, line ranges, typed signatures)
 ./scripts/check.sh --fix src/file.py # fast single-file gate + matching test
-./scripts/check.sh --fix             # format/fix + run all 10 repo quality gates quietly
+./scripts/check.sh --fix             # format/fix + run all 11 repo quality gates quietly
 ```
 
 Individual checks:
@@ -67,6 +67,7 @@ uv run deptry .                        # unused / missing / misplaced deps
 uv run vulture                         # dead / unused code
 uv run lint-imports                    # module import boundaries
 uv run pylint                          # duplicate-code check (R0801)
+uv run codeaudit cimode src            # SAST security scan
 uv run xenon -b B -m A -a A src tests  # cyclomatic complexity gates
 uv run radon mi -n B -s src tests      # maintainability index check (rank A required)
 uv run pytest -q path::test_name       # fast single test (no coverage table)

@@ -21,6 +21,7 @@ Tool output is billed as input tokens on every later turn. Keep it small.
 | Dead code | `uv run vulture` |
 | Import boundaries | `uv run lint-imports` |
 | Duplication | `uv run pylint` |
+| SAST security | `uv run codeaudit cimode src` |
 | Complexity / MI | `uv run xenon -b B -m A -a A src tests` (`radon cc -n C -s src tests`, `radon mi -n B -s src tests`) |
 | Install | `uv sync -q` |
 | Git status | `git status -sb` |

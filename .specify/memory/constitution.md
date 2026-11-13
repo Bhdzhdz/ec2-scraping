@@ -4,7 +4,7 @@
 
 ### I. Automated Quality & Structural Gates (NON-NEGOTIABLE)
 All changes MUST pass `./scripts/check.sh` with zero errors before completion:
-- **Lint, Security & Hygiene (`ruff`)**: Enforces `E, F, W, I, B, UP, SIM, C4, C90, RUF, PT, PL, ERA, ARG, T20, S, ANN, TC, PIE, FURB, PERF, RET, TID` with concise output. No commented-out code (`ERA`), no `print()` in `src/` (`T20`), no unused arguments (`ARG`), no security anti-patterns (`S`).
+- **Lint, Security & Hygiene (`ruff` + `codeaudit`)**: Enforces `E, F, W, I, B, UP, SIM, C4, C90, RUF, PT, PL, ERA, ARG, T20, S, ANN, TC, PIE, FURB, PERF, RET, TID` with concise output, plus AST security validation via `codeaudit cimode src`. No commented-out code (`ERA`), no `print()` in `src/` (`T20`), no unused arguments (`ARG`), no security anti-patterns or SAST weaknesses (`S` / `codeaudit`).
 - **Complexity & Function Size (`ruff` + `xenon` + `radon`)**: Cyclomatic complexity <= 10 (rank A/B per block, rank A module & average via `xenon`), Maintainability Index rank A (`radon mi`), and Pylint structural limits: max 5 arguments, max 10 branches, max 5 returns, max 40 statements per function.
 - **Static Typing (`ty` + `ruff ANN/TC`)**: Explicit type annotations are mandatory on all function and method signatures. `ty check` must pass cleanly.
 - **Zero Duplication & Dead Code (`pylint` + `vulture`)**: No duplicated code blocks >= 6 lines (`pylint` `duplicate-code`); no unused functions, classes, methods, or variables (`vulture`).
